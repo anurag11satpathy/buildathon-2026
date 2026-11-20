@@ -1,33 +1,32 @@
-# Builders Buildathon 2026 — Team Playbook (Anurag & Tanush)
+# Builders Buildathon 2026 — RWX: Blast Radius (Anurag & Tanush)
 
 ## Project Overview
-- **Competition:** Builders Buildathon (automated scoring on unseen test cases; no pitch or judges).
-- **Hard Deadline:** Sunday, Nov 22, 2026 at 12:00 PM ET (feature freeze at 9:00 AM ET).
-- **Track:** [FILL IN AT 6 PM ET — RWX / Builders / Machina / Databricks]
-- **Scoring Rule:** [FILL IN AT 6 PM ET — paste exact metric formula and tie-breakers]
+- **Goal:** Given standalone unified diffs against `sqlglot` (pinned at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`), select which pytest tests to run and assign them across up to 8 workers.
+- **Metric (Lower is Better):** `sum(busiest_worker_sec + 2 * num_workers + 300 * missed_flag) + program_CPU_sec`.
+- **Baseline to Beat:** 1614.1 s (starter runs all tests across 3 workers).
+- **Hard Deadline:** Sunday, Nov 22, 2026 at 11:00 AM ET (feature freeze 9:00 AM ET). Final tiebreaker: within 1.0 s counts as tied, earlier submission wins.
 
-## Hard Constraints (Verify Before Every Submission)
-- **Runtime limit:** [FILL IN AT 6 PM ET]
-- **Memory / API / model limits:** [FILL IN AT 6 PM ET]
-- **Required output format:** [FILL IN AT 6 PM ET]
-- Never hardcode answers from sample test cases or modify validation/test datasets.
-- Never read, print, or commit secrets or `.env` files.
+## Strict Submission & Runtime Rules (Never Violate)
+- **Inputs at runtime:** `/data/commits/<id>.patch` and `/data/tests.json`.
+- **Output format:** Print EXACTLY one JSON line per commit to `stdout`: `{"commit": "k7q2", "workers": [[12, 845], [3, 77]]}`. Use `"workers": []` to run nothing (0 s cost).
+- **Stdout rule:** ALL logs/debug prints MUST go to `stderr`. Any extra `stdout` or > 2 MB `stdout` rejects the run.
+- **Validation rules:** Max 8 workers per commit, no duplicate test IDs within a commit, only valid test IDs from `/data/tests.json`.
+- **Hardware limits (Run):** 2 cores, 4 GB RAM, NO network, read-only root disk, 64 MB empty `/tmp`, user `nobody`, max 256 processes, 3 min batch cap (4.5 min in final).
+- **Hardware limits (Build):** 4 cores, 8 GB RAM, 10 min cap. Only download from PyPI, npm, Docker Hub, fixed-tag GitHub releases, or `sqlglot@eb11aec`.
+- **Repo limit:** Public GitHub repo max **20 MB** total. No Git LFS or submodules. Commit precomputed maps as compact plain files so Docker builds in seconds.
+- **Anti-cheat rule:** NO lookup tables mapping patches or edit types to broken tests. Static/dynamic maps built from pinned `sqlglot@eb11aec` (per-test coverage, import graphs, AST/symbol maps, fixtures) ARE allowed.
+- **Known traps:** A comment-only change is NOT promised to be harmless. Final includes unseen change types. A miss costs +300 s, so skew conservative when uncertain and pack fast borderline tests into idle worker slack for free.
 
-## Commands & Verification
-- **Activate Mac virtual env:** `source .venv/bin/activate`
-- **Run solution:** `python main.py`
-- **Run local evaluation:** `python eval.py` (update this filename if the challenge kit provides its own test script)
-- Always run the local evaluation command after code edits to confirm the score and verify nothing broke before marking a task done.
+## Repo Layout & Commands
+- `selector.py` — Main solution code.
+- `Dockerfile` — Container build recipe at repo root.
+- `Makefile` & `score.py` — Local evaluation harness (`make sample` runs Docker on the 30 sample commits in `sample/`).
+- `SCORING.md` — Official scoring specification.
+- `experiments.csv` — Log of every tested version (`version,commit_hash,owner,hypothesis_or_change,local_score,leaderboard_score,missed_commits,runtime_sec,keep_or_revert`).
+- **Always run `make sample`** after edits to verify local score, 0 missed commits, and low CPU time before finishing a task.
 
-## Repo Layout
-- `main.py` — Core solution code.
-- `eval.py` — Local scoring & error-slicing script mirroring the official metric.
-- `experiments.csv` — Log of every tested version (`version,commit_hash,owner,hypothesis_or_change,local_score,leaderboard_score,runtime_sec,keep_or_revert`).
-- `requirements.txt` — Keep updated whenever a new Python package is installed.
-
-## Working Style & Team Rules
+## Team Working Rules
 - We are a two-person team newer to Git/GitHub. Explain what changed and why in 2–4 plain-English bullet points after edits.
-- Before editing multiple files or making big architectural changes, outline a short step-by-step plan and wait for confirmation.
+- Before editing multiple files or making big architectural changes, outline a short step-by-step plan and wait for our confirmation.
 - Make one targeted change at a time so we can measure whether it improved the score.
-- Do not run `git commit`, `git push`, or destructive git commands on our behalf—we handle commits and syncing manually through Cursor's Source Control tab.
-- Keep `CLAUDE.md` under 200 lines; if we correct the same mistake twice, propose a one-line rule to add here.
+- NEVER run `git commit`, `git push`, or destructive git commands—we handle Git manually in Cursor's Source Control tab.
