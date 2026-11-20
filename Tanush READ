@@ -1,0 +1,6 @@
+Tanush these are instructions on how to basically set up cursor with claude and set up the things, I'm gonna have a few things done tho
+
+Clone the repo into Cursor using HTTPS
+
+Go back to the Code tab, click the green Code button, confirm the HTTPS tab is selected (not SSH), and copy the URL starting with [https://github.com/](https://github.com/). Open Cursor (signed into GitHub), press Cmd+Shift+P (Mac) or Ctrl+Shift+P (Windows), type Git: Clone, press Enter, paste the HTTPS link, pick a folder to save it in, and click Open.
+Verification: BUILDATHON-2026 appears in Cursor's left Explorer sidebar with README.md and .gitignore, and the bottom-left corner shows main.
