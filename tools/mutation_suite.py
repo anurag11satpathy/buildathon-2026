@@ -407,6 +407,16 @@ def mutant_specs(rng):
                                                     "self._curr = tokens[index] if index <= size else SENTINEL_NONE")),
         ("eq04", "eq_custom_eq_none", lambda: m_anchor("sqlglot/optimizer/simplify.py",
                                                        "if new_expression is None:", "if new_expression == None:")),
+        # v15 guardrails: each must defeat its lever's check and fall back safely
+        ("gd01", "guard_dialect_import", lambda: m_anchor("sqlglot/dialects/mysql.py",
+                                                          "    DPIPE_IS_STRING_CONCAT = False",
+                                                          "    DPIPE_IS_STRING_CONCAT = UNDEFINED_SETTING_XYZ")),
+        ("gd02", "guard_tpch_load", lambda: m_anchor("tests/fixtures/optimizer/tpc-h/tpc-h.sql",
+                                                     "-- TPC-H 1\n--------------------------------------\nselect",
+                                                     "-- TPC-H 1\n--------------------------------------\n# broken meta line\nselect")),
+        ("gd03", "guard_func_sql_names", lambda: m_anchor("sqlglot/expressions/functions.py",
+                                                          '_sql_names = ["COALESCE", "IFNULL", "NVL"]',
+                                                          '_sql_names = ["COALESCE", "IFNULL"]')),
     ]
 
 
@@ -500,7 +510,8 @@ def cmd_select(args):
         log(f"no ground truth yet (skipped): {missing}")
 
     with open(stage / "output.jsonl", "wb") as out, open(stage / "selector.log", "wb") as err:
-        rc = run(["docker", "run", *RUN_FLAGS,
+        strict = ["-e", "BLAST_NO_SLACK=1"] if getattr(args, "strict", False) else []
+        rc = run(["docker", "run", *RUN_FLAGS, *strict,
                   "-v", f"{docker_path(stage / 'commits')}:/data/commits:ro",
                   "-v", f"{docker_path(stage / 'tests.json')}:/data/tests.json:ro",
                   SELECTOR_IMAGE], stdout=out, stderr=err).returncode
@@ -561,7 +572,8 @@ def main():
     ap.add_argument("cmd", choices=["build", "gen", "oracle", "select", "validate"])
     ap.add_argument("--suite", default="mutants")
     ap.add_argument("--only", default="")
-    ap.add_argument("--workers", default="3")  # 6 made test_execute_tpcds flaky (pool workers starved)
+    ap.add_argument("--workers", default="3")
+    ap.add_argument("--strict", action="store_true", help="select: disable slack-packing (selections must stand alone)")  # 6 made test_execute_tpcds flaky (pool workers starved)
     args = ap.parse_args()
     sys.exit({"build": cmd_build, "gen": cmd_gen, "oracle": cmd_oracle,
               "select": cmd_select, "validate": cmd_validate}[args.cmd](args) or 0)

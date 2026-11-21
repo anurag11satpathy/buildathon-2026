@@ -95,6 +95,33 @@ SWAP_PAIRS = {("Is", "Eq"), ("Eq", "Is"), ("IsNot", "NotEq"), ("NotEq", "IsNot")
               ("Lt", "LtE"), ("LtE", "Lt"), ("Gt", "GtE"), ("GtE", "Gt")}
 EXPR_INST_PATH = APP / "data" / "expr_inst.json.gz"  # tools/build_expr_inst.py
 INST_KEEP_CLASS_REFS = False  # also union refs(class) on top of instantiation evidence
+# Lever T: the only TestExecutor tests that read TPC-H data (tests/test_executor.py:158,188)
+TPCH_FIXTURE = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+TPCH_READERS = ("tests/test_executor.py::TestExecutor::test_optimized_tpch",
+                "tests/test_executor.py::TestExecutor::test_execute_tpch")
+FIXTURE_LOAD_CHILD = r"""
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+from tests.helpers import load_sql_fixture_pairs
+sys.exit(0 if list(load_sql_fixture_pairs(sys.argv[3])) else 1)
+"""
+# Lever D: patched dialect must import and build tokenizer/parser/generator cleanly
+DIALECT_IMPORT_CHILD = r"""
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+from sqlglot.dialects.dialect import Dialect
+for name in sys.argv[3:]:
+    d = Dialect.get_or_raise(name)
+    d.tokenizer(); d.parser(); d.generator()
+    d.transpile("SELECT a, b FROM c WHERE d = 1")
+"""
+DIALECT_IMPORT_TIMEOUT_S = 6
+REFS_EXTERNAL_PATH = APP / "data" / "refs_external.json.gz"  # tools/build_refs_external.py
+# methods that mutate shared objects: a class body calling them may change other classes
+MUTATORS = {"pop", "update", "append", "extend", "remove", "clear", "setdefault", "add",
+            "discard", "insert", "popitem", "__setitem__", "__delitem__"}
+# Lever A: Func attributes read at import (FUNCTION_BY_NAME) or before instantiation
+FUNC_NAME_ATTRS = {"_sql_names", "sql_names", "key", "is_var_len_args"}
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -364,6 +391,79 @@ def ast_equal(a, b):
     return a == b
 
 
+def _docstring(stmt):
+    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+
+
+def ast_equal_nodoc(a, b):
+    """ast_equal, except docstring *text* (first statement of a module, class or
+    function) may differ. Adding or removing a docstring still counts as a change."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        for f in a._fields:
+            x, y = getattr(a, f, None), getattr(b, f, None)
+            if f == "body" and x and y and _docstring(x[0]) and _docstring(y[0]):
+                x, y = x[1:], y[1:]
+            elif f == "body" and x and y and (_docstring(x[0]) != _docstring(y[0])):
+                return False
+            if not ast_equal_nodoc(x, y):
+                return False
+        return True
+    if isinstance(a, ast.AST):
+        return all(ast_equal_nodoc(getattr(a, f, None), getattr(b, f, None)) for f in a._fields)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(ast_equal_nodoc(x, y) for x, y in zip(a, b))
+    if isinstance(a, (float, complex)):
+        return repr(a) == repr(b)
+    return a == b
+
+
+def class_body_edit_is_plain(old_tree, new_tree, classes):
+    """True if every changed statement inside the edited top-level classes is a plain
+    NAME = value assignment (or a method) that calls no mutating method: such an edit
+    only changes that class (and subclasses), never another object."""
+    def stmts(tree):
+        out = []
+
+        def walk(body):
+            for st in body:
+                if isinstance(st, ast.ClassDef):
+                    out.append(("class", st.name, ast.dump(ast.Module(body=[], type_ignores=[])) + ast.dump(
+                        ast.Tuple(elts=st.bases + [k.value for k in st.keywords] + st.decorator_list, ctx=ast.Load()))))
+                    walk(st.body)
+                else:
+                    out.append(("stmt", st, ast.dump(st)))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name in classes:
+                walk(node.body)
+        return out
+
+    old, new = stmts(old_tree), stmts(new_tree)
+    old_keys = [k[2] for k in old]
+    new_keys = [k[2] for k in new]
+    from collections import Counter as _C
+    oc, nc = _C(old_keys), _C(new_keys)
+    changed = [k for k in old if nc[k[2]] < oc[k[2]]] + [k for k in new if oc[k[2]] < nc[k[2]]]
+    for kind, node, _ in changed:
+        if kind == "class":
+            return False  # nested class header (bases/decorators) changed
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.Assign):
+            if not all(isinstance(t, ast.Name) for t in node.targets):
+                return False
+        elif isinstance(node, ast.AnnAssign):
+            if not isinstance(node.target, ast.Name):
+                return False
+        elif not _docstring(node):
+            return False
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr in MUTATORS:
+                return False
+    return True
+
+
 def changed_classes(old_tree, new_tree):
     """Names of top-level classes whose bodies differ, if the edit is confined to
     class bodies (same top-level statements, same classes/bases/decorators);
@@ -500,6 +600,7 @@ class Selector:
         nocov = {number_of[tid] for tid in m.get("nocov", []) if tid in number_of}
         self.always = uncovered | nocov | (self.all_numbers - mapped)
         self.genmem = number_of.get(GENMEM_ID)
+        self.number_of = number_of
         self.test_id = {n: tid for tid, n in number_of.items()}
         self.test_file = {t["number"]: t["file"] for t in tests}
         # the no-coverage tests each depend on something specific (see NOCOV_GATES);
@@ -562,6 +663,29 @@ class Selector:
                     d.setdefault(ln, set()).update(names)
             self._dialect_lines[rel] = d
         return self._dialect_lines[rel]
+
+    def fixture_loads(self, ch, fixture_name):
+        """Run TestExecutor.setUpClass's exact loader on the patched fixture."""
+        tmp = None
+        try:
+            if ch.renamed or ch.binary or not ch.old_path or not ch.new_path:
+                return False
+            tmp = tempfile.mkdtemp(prefix="fixture-", dir="/tmp")
+            (Path(tmp) / "tests").mkdir()
+            for f in ("__init__.py", "helpers.py"):
+                shutil.copy2(SRC / "tests" / f, Path(tmp) / "tests" / f)
+            target = Path(tmp) / ch.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(ch.apply((SRC / ch.path).read_text(encoding="utf-8")), encoding="utf-8")
+            r = subprocess.run([sys.executable, "-c", FIXTURE_LOAD_CHILD, tmp, str(SRC), fixture_name],
+                               cwd=tmp, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                               capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
 
     def plain_source_changes(self):
         """Parsed changes if every one is a plain edit of an existing sqlglot/*.py."""
@@ -736,7 +860,60 @@ class Selector:
             out |= self.set_numbers(sid)
         return out
 
-    def class_body_selection(self, rel, info, old_tree, classes, def_names, edited_targets, why):
+    def bits_to_tests(self, hexbits):
+        b, out, i = int(hexbits, 16), set(), 0
+        while b:
+            if b & 1 and i < len(self.bit_to_number) and self.bit_to_number[i] is not None:
+                out.add(self.bit_to_number[i])
+            b >>= 1
+            i += 1
+        return out
+
+    def refs_external(self, name):
+        if not hasattr(self, "_refs_ext"):
+            try:
+                self._refs_ext = json.loads(gzip.decompress(REFS_EXTERNAL_PATH.read_bytes()))
+            except (OSError, ValueError):
+                self._refs_ext = None
+        if self._refs_ext is None:
+            return set(self.refs(name))  # unavailable: fall back to the broad table
+        return self.bits_to_tests(self._refs_ext[name]) if name in self._refs_ext else set()
+
+    def dialect_active_tests(self, fan):
+        """Tests that instantiate a class of one of these dialect modules (or a
+        subclass) during a test, per the build-time map; None if unknown."""
+        inst = self.expr_inst()
+        if inst is None or "dialect_active" not in inst:
+            return None
+        if set(fan) & (set(inst.get("dialect_import_time", ())) | set(inst.get("dialect_collected_in", {}))):
+            return None
+        out = set()
+        for d in fan:
+            if d in inst["dialect_active"]:
+                out |= self.bits_to_tests(inst["dialect_active"][d])
+        return out
+
+    def verify_dialect_import(self, fan, changes):
+        """True: patched dialects import and build tokenizer/parser/generator; False:
+        they raise (or hang); None: could not check."""
+        overlay = None
+        try:
+            overlay = self.make_overlay(changes)
+        except Exception:
+            return None
+        try:
+            r = subprocess.run([sys.executable, "-c", DIALECT_IMPORT_CHILD, overlay, str(SRC), *fan],
+                               cwd=overlay, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                               capture_output=True, timeout=DIALECT_IMPORT_TIMEOUT_S)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return None
+        finally:
+            shutil.rmtree(overlay, ignore_errors=True)
+
+    def class_body_selection(self, rel, info, old_tree, classes, def_names, edited_targets, why, new_tree=None):
         """Phase 2 narrowing for an edit confined to class bodies. Returns the
         extra tests to select, or None to keep the conservative rule."""
         if self.dialect_usage is None or rel in BASE_FILES or not classes:
@@ -748,6 +925,42 @@ class Selector:
             # a dialect's own class attributes only matter when that dialect (or one
             # inheriting/reusing it) runs: tests that run or name those dialects
             fan = [parts[2][:-3]] + self.dialect_children.get(parts[2][:-3], [])
+            # Lever D: drop tests that only *import* these dialect modules (e.g. a pool
+            # worker importing every dialect), once the patched dialects provably import
+            # and build cleanly; class attributes only act through instances/subclasses
+            active = self.dialect_active_tests(fan)
+            changes = self.plain_source_changes()
+            # only pay for the in-container import check when it can actually save time
+            worth_it = False
+            if active is not None:
+                broad = set(self.usage_tests("__all__")) | set(self.set_numbers(info["import"]))
+                narrow = active | self.usage_tests("__all__")
+                for d in fan:
+                    broad |= self.dialect_tests(d) | self.usage_tests(d)
+                    narrow |= self.usage_tests(d) | self.file_tests.get(f"tests/dialects/test_{d}.py", set())
+                for n in (set(classes) | def_names) - GENERIC_NAMES:
+                    broad |= self.refs(n)
+                worth_it = split_cost_ms([(self.ms_of[n], n) for n in narrow]) \
+                    < split_cost_ms([(self.ms_of[n], n) for n in broad]) - 500
+            if worth_it and changes and new_tree is not None \
+                    and class_body_edit_is_plain(old_tree, new_tree, set(classes)):
+                ok = self.verify_dialect_import(fan, changes)
+                if ok is False:
+                    why.append(f"patched dialect {fan} fails to import/build: run all")
+                    return "ALL"
+                if ok:
+                    out |= active | self.usage_tests("__all__")
+                    for d in fan:
+                        out |= self.usage_tests(d) | self.file_tests.get(f"tests/dialects/test_{d}.py", set())
+                    # generic code reading a dialect class's attributes explicitly
+                    # (e.g. generator.py: TSQL.CONVERT_FORMAT_MAPPING); bare isinstance/
+                    # import mentions do not depend on the class body
+                    file_classes = {n.name for n in old_tree.body if isinstance(n, ast.ClassDef)}
+                    for n in set(classes) | file_classes:
+                        out |= self.refs_external(n)
+                    self._passive_dropped = True  # caller: leave out the import-time set
+                    why.append(f"class-body (dialect {fan}, active users; import verified) {sorted(specific)[:4]}")
+                    return out
             for d in fan:
                 out |= self.dialect_tests(d) | self.usage_tests(d)
             out |= self.usage_tests("__all__")
@@ -778,8 +991,8 @@ class Selector:
                     continue
                 seen.add(c)
                 bn = base_names(c)
-                if bn & FUNC_BASES:
-                    return None
+                if bn & FUNC_BASES and (edited_targets & FUNC_NAME_ATTRS or def_names):
+                    return None  # SQL-name tables / from_arg_list read these before instantiation
                 stack.extend(x for x in bn if x in tops)
             inst = self.expr_inst()
             if inst is None or scope & (inst["import_time"] | set(inst.get("collected_in", {}))):
@@ -874,6 +1087,10 @@ class Selector:
         if not encoding_touched and ast_equal(old_tree, new_tree):
             why.append(f"AST-identical (comment/whitespace only) {rel}")
             return set()
+        if not encoding_touched and ast_equal_nodoc(old_tree, new_tree):
+            # only docstring text changed: sqlglot reads __doc__ solely to default it to ""
+            why.append(f"docstring-only edit {rel}")
+            return set()
         if not encoding_touched and self.safe_cmps and only_safe_cmp_swaps(rel, old_tree, new_tree, self.safe_cmps):
             # every changed comparison gives the identical result on every execution
             # of the pinned suite: no test can change (test_typing stays gated by path)
@@ -943,6 +1160,7 @@ class Selector:
                 def_names |= set(qual.split("."))
             why.append(f"defs added/removed in {rel}: {sorted(diff)[:3]}")
 
+        func_sel = set(sel)  # function-level evidence only (before module-level additions)
         if module_lines or def_names:
             self.body_only = False
             self.lazy_trigger = True  # module/class-level code runs at import time
@@ -995,7 +1213,12 @@ class Selector:
             narrowed = None
             if classes_changed:
                 narrowed = self.class_body_selection(rel, info, tree, classes_changed,
-                                                     def_names, edited_targets, why)
+                                                     def_names, edited_targets, why, new_tree)
+            if narrowed == "ALL":
+                return None
+            if narrowed is not None and getattr(self, "_passive_dropped", False):
+                self._passive_dropped = False
+                return func_sel | narrowed
             if narrowed is not None:
                 return sel | narrowed
             if classes_changed:  # conservative path: restore the next-function tests
@@ -1122,6 +1345,12 @@ class Selector:
                 self.body_only = False  # fixtures, test files, ...: not a function-body edit
             if rel in self.m["files"]:
                 s = self.select_source(ch, why)
+            elif rel == TPCH_FIXTURE and self.fixture_loads(ch, "optimizer/tpc-h/tpc-h.sql"):
+                # Lever T: setUpClass still loads the patched file, so only the tests that
+                # read TPC-H data (and the fixture's own readers) can change
+                s = {n for n in self.set_numbers(self.m["fixtures"][rel]) if n not in self.setup_class_fanout}
+                s |= {self.number_of[t] for t in TPCH_READERS if t in self.number_of}
+                why.append("tpc-h fixture: loads cleanly in-container -> TPC-H readers only")
             elif rel in self.m["fixtures"]:
                 s = set(self.set_numbers(self.m["fixtures"][rel])); why.append(f"fixture {name}")
                 for first, members in self.setup_class_fanout.items():
@@ -1174,7 +1403,7 @@ def main() -> None:
                     sel = selector.verify_generator_memory(sel, why)
                     sel = selector.verify_light(sel, why)
                     workers = best_split([(selector.ms_of[n], n) for n in sel])
-                    if len(workers) >= 2:  # a single worker has no idle time
+                    if len(workers) >= 2 and os.environ.get("BLAST_NO_SLACK") != "1":
                         before = len(sel)
                         workers = fill_slack(workers, selector.slack_candidates(sel), selector.ms_of)
                         why.append(f"slack +{sum(map(len, workers)) - before} free tests")

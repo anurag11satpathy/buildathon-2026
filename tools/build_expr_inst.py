@@ -42,17 +42,27 @@ def _run_ctx(ctx, fn, *args, **kwargs):  # executed inside pool workers
         CTX = prev
 
 
-def _patch(module):
-    Expr = module.Expr
+def _hook_new(base, tag):
     def __new__(cls, *args, **kwargs):
-        _record(cls)
+        SEEN.setdefault(CTX, set()).add(f"{tag}{cls.__module__}.{cls.__qualname__}")
         return object.__new__(cls)
-    Expr.__new__ = __new__
+    base.__new__ = __new__
+
+
+# module -> base classes whose instances we record ("" tag: expressions, "D|": dialect use)
+HOOKS = {"sqlglot.expressions.core": [("Expr", "")], "sqlglot.dialects.dialect": [("Dialect", "D|")],
+         "sqlglot.parser": [("Parser", "D|")], "sqlglot.generator": [("Generator", "D|")],
+         "sqlglot.tokens": [("Tokenizer", "D|")]}
+
+
+def _patch(module):
+    for attr, tag in HOOKS[module.__name__]:
+        _hook_new(getattr(module, attr), tag)
 
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path, target=None):
-        if name != "sqlglot.expressions.core":
+        if name not in HOOKS:
             return None
         spec = importlib.machinery.PathFinder.find_spec(name, path)
         if spec is None:
@@ -129,15 +139,21 @@ r = subprocess.run([sys.executable, "-m", "pytest", "tests", "-n", "3", "--dist"
                     "-p", "no:cacheprovider", "-q", "-o", "timeout=0", "--no-header"],
                    cwd="/pristine", env=env, capture_output=True, text=True)
 by_test, import_time, collect = {}, set(), {}
+d_test, d_import, d_collect = {}, set(), {}
 files = glob.glob(f"{OUT}/*.json")
 for f in files:
     for ctx, names in json.load(open(f)).items():
+        dn = {n[2:] for n in names if n.startswith("D|")}
+        en = {n for n in names if not n.startswith("D|")}
         if ctx.startswith("collect:"):
-            collect.setdefault(ctx[len("collect:"):], set()).update(names)
+            collect.setdefault(ctx[len("collect:"):], set()).update(en)
+            d_collect.setdefault(ctx[len("collect:"):], set()).update(dn)
         elif ctx:
-            by_test.setdefault(ctx, set()).update(names)
+            by_test.setdefault(ctx, set()).update(en)
+            d_test.setdefault(ctx, set()).update(dn)
         else:
-            import_time.update(names)
+            import_time.update(en)
+            d_import.update(dn)
 sys.path.insert(0, "/pristine")
 from sqlglot.expressions.core import Expr
 def resolve(qual):
@@ -181,7 +197,39 @@ for path, quals in collect.items():
             cache[q] = names_for(q)
         for name in cache[q]:
             collected.setdefault(name, set()).add(path)
+DPKGS = ("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.", "sqlglot.typing.")
+SHARED = {"__init__", "dialect", "base"}
+def dialects_of(qual):
+    cls = resolve(qual)
+    if cls is None:
+        return set()
+    out = set()
+    for b in cls.__mro__:
+        mod = getattr(b, "__module__", "") or ""
+        if mod.startswith(DPKGS) and mod.rsplit(".", 1)[-1] not in SHARED:
+            out.add(mod.rsplit(".", 1)[-1])
+    return out
+dcache, dialect_active = {}, {}
+for tid, quals in d_test.items():
+    if tid not in index:
+        continue
+    bit = 1 << index[tid]
+    for q in quals:
+        if q not in dcache:
+            dcache[q] = dialects_of(q)
+        for d in dcache[q]:
+            dialect_active[d] = dialect_active.get(d, 0) | bit
+d_collected = {}
+for path, quals in d_collect.items():
+    for q in quals:
+        for d in dcache.get(q) or dialects_of(q):
+            d_collected.setdefault(d, set()).add(path)
+d_imp = set()
+for q in d_import:
+    d_imp |= dialects_of(q)
 out = {"tests": len(tests), "classes": {k: format(v, "x") for k, v in sorted(classes.items())},
+       "dialect_active": {k: format(v, "x") for k, v in sorted(dialect_active.items())},
+       "dialect_import_time": sorted(d_imp), "dialect_collected_in": {k: sorted(v) for k, v in sorted(d_collected.items())},
        "import_time": sorted(imp), "collected_in": {k: sorted(v) for k, v in sorted(collected.items())}}
 with gzip.open("/out/expr_inst.json.gz", "wt") as f:
     json.dump(out, f, separators=(",", ":"))
@@ -194,6 +242,9 @@ print(json.dumps({"pytest_exit": r.returncode, "tail": r.stdout.strip().splitlin
                   "TriggerProperties": count("TriggerProperties"), "Join": count("Join"),
                   "Select": count("Select"), "Expression": count("Expression"),
                   "files_instantiating_at_collection": len(collect),
+                  "dialect_active_counts": {d: bin(v).count("1") for d, v in sorted(dialect_active.items())},
+                  "dialect_import_time": sorted(d_imp), "dialect_collected_in": {k: sorted(v) for k, v in sorted(d_collected.items())},
+                  "tpcds_actively_uses": sorted(d for d, v in dialect_active.items() if v >> index["tests/test_executor.py::TestExecutor::test_execute_tpcds"] & 1),
                   "Join_collected_in": sorted(collected.get("Join", ()))[:8]}, indent=1))
 '''
 
