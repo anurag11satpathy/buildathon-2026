@@ -39,7 +39,8 @@ OPS = {"Is": operator.is_, "IsNot": operator.is_not, "Eq": operator.eq, "NotEq":
 SWAP = {"Is": "Eq", "Eq": "Is", "IsNot": "NotEq", "NotEq": "IsNot",
         "Lt": "LtE", "LtE": "Lt", "Gt": "GtE", "GtE": "Gt"}
 BASIC = {type(None), bool, int, float, str, bytes}
-ORDER_OK = {(int, int), (float, float), (int, float), (float, int), (str, str)}
+ORDER_OK = {(int, int), (float, float), (int, float), (float, int), (str, str), (tuple, tuple)}
+PRIMS = (int, float, str, bytes, bool, type(None))
 STATS = {}  # site -> [count, equiv_ok, types_safe, {type pairs}, singleton_ok]
 
 
@@ -71,6 +72,10 @@ def probe(site, op, left, right):
     if st is None:
         st = STATS[site] = [0, True, True, set(), True]
     st[0] += 1
+    if st[1] and st[2] and op in ("Lt", "LtE", "Gt", "GtE") and type(left) is tuple and type(right) is tuple:
+        # tuples only qualify while every element is a primitive (checked on every call)
+        if not all(type(e) in PRIMS for e in left + right):
+            st[2] = False
     if st[1] and st[2]:
         key = (type(left), type(right))
         if key not in st[3]:

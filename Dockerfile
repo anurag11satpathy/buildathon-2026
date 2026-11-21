@@ -22,6 +22,7 @@ COPY data/dialect_usage.json /app/data/dialect_usage.json
 COPY data/safe_cmps.json.gz /app/data/safe_cmps.json.gz
 COPY data/expr_inst.json.gz /app/data/expr_inst.json.gz
 COPY data/refs_external.json.gz /app/data/refs_external.json.gz
+COPY data/heavy_lines.json.gz /app/data/heavy_lines.json.gz
 COPY selector.py /app/selector.py
 # precompiled bytecode (the run's disk is read-only, so Python cannot cache it),
 # readable by user nobody at run time

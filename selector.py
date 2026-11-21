@@ -58,7 +58,7 @@ NOCOV_GATES = {
 # code and drop it from the workers only if it passes cleanly.
 GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_UNITTEST = "tests.test_generator.TestGenerator.test_generator_memory"
-GENMEM_MIN_GAIN_MS = 2000  # live CPU ran ~2.4x local; every sample win saves >= 2.2 s
+GENMEM_MIN_GAIN_MS = 2000  # ~1.8x its ~1.05 s CPU (kept)  # live CPU ran ~2.4x local; every sample win saves >= 2.2 s
 GENMEM_TIMEOUT_S = 6
 LIGHT_MAX_TEST_MS = 600      # light verification: only tiny 1-worker selections
 LIGHT_MIN_GAIN_MS = 1500
@@ -122,6 +122,7 @@ MUTATORS = {"pop", "update", "append", "extend", "remove", "clear", "setdefault"
             "discard", "insert", "popitem", "__setitem__", "__delitem__"}
 # Lever A: Func attributes read at import (FUNCTION_BY_NAME) or before instantiation
 FUNC_NAME_ATTRS = {"_sql_names", "sql_names", "key", "is_var_len_args"}
+HEAVY_LINES_PATH = APP / "data" / "heavy_lines.json.gz"  # tools/build_heavy_lines.py
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -464,6 +465,40 @@ def class_body_edit_is_plain(old_tree, new_tree, classes):
     return True
 
 
+def edited_statement_lines(rel, tree, removed, inserts):
+    """(rel, line) pairs a test must have executed for an edit to reach it.
+    Removed/changed line -> its innermost enclosing statement (compound statements:
+    their header lines). Inserted line -> every line of the innermost enclosing block
+    (compound statement or function), so an insertion into any block the test runs
+    is never treated as unreached. Unknown -> a sentinel that matches nothing safely."""
+    stmts = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+
+    def innermost(line, compound_only=False):
+        best = None
+        for n in stmts:
+            if compound_only and not any(getattr(n, f, None) for f in ("body", "orelse", "finalbody", "handlers")):
+                continue
+            if n.lineno <= line <= (n.end_lineno or n.lineno):
+                if best is None or (n.end_lineno - n.lineno) < (best.end_lineno - best.lineno):
+                    best = n
+        return best
+
+    out = set()
+    for ln in removed:
+        n = innermost(ln)
+        if n is None:
+            return {("?", 0)}
+        bodies = [getattr(n, f)[0].lineno for f in ("body", "orelse", "finalbody", "handlers") if getattr(n, f, None)]
+        hi = (min(bodies) - 1) if bodies and min(bodies) > n.lineno else (n.end_lineno or n.lineno)
+        out |= {(rel, x) for x in range(n.lineno, max(hi, n.lineno) + 1)}
+    for ln in inserts:
+        n = innermost(ln, compound_only=True) or innermost(ln - 1, compound_only=True)
+        if n is None:
+            return {("?", 0)}
+        out |= {(rel, x) for x in range(n.lineno, (n.end_lineno or n.lineno) + 1)}
+    return out
+
+
 def changed_classes(old_tree, new_tree):
     """Names of top-level classes whose bodies differ, if the edit is confined to
     class bodies (same top-level statements, same classes/bases/decorators);
@@ -686,6 +721,31 @@ class Selector:
         finally:
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
+
+    def drop_unreached_heavy(self, sel, why):
+        """Function-body-only edits: drop a slow test whose exact executed lines (build-
+        time trace, fresh process per test, all processes) include none of the edited
+        statements. Never for class-body/table edits (body_only is False for those)."""
+        if not sel or not getattr(self, "body_only", False) or not self.edit_lines \
+                or ("?", 0) in self.edit_lines or self.plain_source_changes() is None:
+            return sel
+        if not hasattr(self, "_heavy"):
+            try:
+                raw = json.loads(gzip.decompress(HEAVY_LINES_PATH.read_bytes()))["tests"]
+                self._heavy = {self.number_of[t]: v for t, v in raw.items() if t in self.number_of}
+                self._heavy_sets = {}
+            except (OSError, ValueError, KeyError):
+                self._heavy = {}
+        dropped = set()
+        for n in sel & set(self._heavy):
+            if n not in self._heavy_sets:
+                self._heavy_sets[n] = {(rel, ln) for rel, rngs in self._heavy[n].items()
+                                       for a, b in rngs for ln in range(a, b + 1)}
+            if not (self.edit_lines & self._heavy_sets[n]):
+                dropped.add(n)
+        if dropped:
+            why.append(f"line-level: {len(dropped)} slow test(s) never execute the edited lines")
+        return sel - dropped
 
     def plain_source_changes(self):
         """Parsed changes if every one is a plain edit of an existing sqlglot/*.py."""
@@ -941,7 +1001,7 @@ class Selector:
                 for n in (set(classes) | def_names) - GENERIC_NAMES:
                     broad |= self.refs(n)
                 worth_it = split_cost_ms([(self.ms_of[n], n) for n in narrow]) \
-                    < split_cost_ms([(self.ms_of[n], n) for n in broad]) - 500
+                    < split_cost_ms([(self.ms_of[n], n) for n in broad]) - 650  # ~1.8x the ~0.35 s check
             if worth_it and changes and new_tree is not None \
                     and class_body_edit_is_plain(old_tree, new_tree, set(classes)):
                 ok = self.verify_dialect_import(fan, changes)
@@ -1081,6 +1141,7 @@ class Selector:
             return None
 
         removed, inserts, texts = ch.touched()
+        self.edit_lines |= edited_statement_lines(rel, old_tree, removed, inserts)
         # a pure comment/whitespace edit: the code is identical. Only an encoding
         # declaration (first two lines) can change how the bytes are read.
         encoding_touched = any(ln <= 2 for ln in removed | inserts) and any("coding" in t for t in texts)
@@ -1318,6 +1379,7 @@ class Selector:
         self.lazy_trigger = False
         self.real_change_paths = set()
         self.body_only = True
+        self.edit_lines = set()
         if text.strip() and not self.last_paths:
             why.append("non-empty patch with no recognisable file changes")
             return None, why
@@ -1400,6 +1462,7 @@ def main() -> None:
             try:
                 sel, why = selector.select_commit(patch.read_text(encoding="utf-8", errors="replace"))
                 if sel is not None:
+                    sel = selector.drop_unreached_heavy(sel, why)
                     sel = selector.verify_generator_memory(sel, why)
                     sel = selector.verify_light(sel, why)
                     workers = best_split([(selector.ms_of[n], n) for n in sel])
