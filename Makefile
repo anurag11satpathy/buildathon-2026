@@ -20,7 +20,7 @@ build:
 # scores what it printed.
 sample: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
-	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
+	python score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
 
 # The output's rules only: every line well formed and every commit answered.
 # A wrong selection still passes here; make sample counts the misses.
