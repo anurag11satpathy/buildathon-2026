@@ -67,6 +67,10 @@ suite = unittest.defaultTestLoader.loadTestsFromName(sys.argv[3])
 result = unittest.TextTestRunner(stream=open("/dev/null", "w"), verbosity=0).run(suite)
 sys.exit(0 if result.testsRun == 1 and result.wasSuccessful() else 1)
 """
+SAFE_CMPS_PATH = APP / "data" / "safe_cmps.json.gz"  # tools/build_cmp_profile.py
+# operator swaps a profiled site may be proven safe for (old op -> new op)
+SWAP_PAIRS = {("Is", "Eq"), ("Eq", "Is"), ("IsNot", "NotEq"), ("NotEq", "IsNot"),
+              ("Lt", "LtE"), ("LtE", "Lt"), ("Gt", "GtE"), ("GtE", "Gt")}
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -356,6 +360,36 @@ def changed_classes(old_tree, new_tree):
     return changed
 
 
+def only_safe_cmp_swaps(rel, old_tree, new_tree, safe):
+    """True only if the trees are identical except for 2-operand comparisons whose
+    operator swapped across a SWAP_PAIRS pair at a site the build-time profile
+    proved equivalent (same bool on every execution of the full pinned suite,
+    side-effect-free operand types)."""
+    found = False
+
+    def walk(a, b):
+        nonlocal found
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.Compare) and len(a.ops) == 1 and len(b.ops) == 1 \
+                and len(a.comparators) == 1 and len(b.comparators) == 1 \
+                and type(a.ops[0]) is not type(b.ops[0]):
+            old_op, new_op = type(a.ops[0]).__name__, type(b.ops[0]).__name__
+            if (old_op, new_op) not in SWAP_PAIRS or safe.get(f"{rel}:{a.lineno}:{a.col_offset}") != old_op:
+                return False
+            found = True
+            return walk(a.left, b.left) and walk(a.comparators, b.comparators)
+        if isinstance(a, ast.AST):
+            return all(walk(getattr(a, f, None), getattr(b, f, None)) for f in a._fields)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
+        if isinstance(a, (float, complex)):
+            return repr(a) == repr(b)
+        return a == b
+
+    return walk(old_tree, new_tree) and found
+
+
 def changed_hooks(old, new):
     return sorted(k for k in old.keys() | new.keys()
                   if k not in old or k not in new or not ast_equal(old[k], new[k]))
@@ -458,6 +492,11 @@ class Selector:
             self.imp = {"core": {}, "dialects": {}}
         self._core_lines, self._dialect_lines = {}, {}
         self._base, self._dialect_tests = {}, {}
+        try:
+            self.safe_cmps = json.loads(gzip.decompress(SAFE_CMPS_PATH.read_bytes()))
+        except (OSError, ValueError) as e:
+            log(f"WARNING: comparison profile unavailable ({e!r}); no equivalence proofs")
+            self.safe_cmps = {}
         # cov_plugin switches context per test, so whatever a class's setUpClass
         # opens is credited to the class's first test (unittest runs test methods
         # in alphabetical order): map that first test -> all tests of the class
@@ -688,6 +727,12 @@ class Selector:
         encoding_touched = any(ln <= 2 for ln in removed | inserts) and any("coding" in t for t in texts)
         if not encoding_touched and ast_equal(old_tree, new_tree):
             why.append(f"AST-identical (comment/whitespace only) {rel}")
+            return set()
+        if not encoding_touched and self.safe_cmps and only_safe_cmp_swaps(rel, old_tree, new_tree, self.safe_cmps):
+            # every changed comparison gives the identical result on every execution
+            # of the pinned suite: no test can change (test_typing stays gated by path)
+            self.real_change_paths.add(rel)
+            why.append(f"proven no-op comparison swap(s) in {rel}")
             return set()
         self.real_change_paths.add(rel)
 

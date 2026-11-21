@@ -395,6 +395,18 @@ def mutant_specs(rng):
                                                         '"match_condition": False,', '"match_condition": True,')),
         ("sm04", "v9_alias_dialect", lambda: m_anchor("sqlglot/generators/trino.py",
                                                       "SUPPORTS_LEFT_JOIN_UNNEST = True", "SUPPORTS_LEFT_JOIN_UNNEST = False")),
+        # v13 adversarial comparison swaps: none of these may be treated as a proven no-op
+        ("eq01", "eq_expression_identity", lambda: m_anchor("sqlglot/optimizer/scope.py",
+                                                            "if node is self.expression or not isinstance(node, COLLECTIBLE_TYPES):",
+                                                            "if node == self.expression or not isinstance(node, COLLECTIBLE_TYPES):")),
+        ("eq02", "eq_runtime_string", lambda: m_anchor("sqlglot/parser.py",
+                                                       'if self._prev.text.upper() == "BUCKET"',
+                                                       'if self._prev.text.upper() is "BUCKET"')),
+        ("eq03", "eq_boundary_lt", lambda: m_anchor("sqlglot/parser.py",
+                                                    "self._curr = tokens[index] if index < size else SENTINEL_NONE",
+                                                    "self._curr = tokens[index] if index <= size else SENTINEL_NONE")),
+        ("eq04", "eq_custom_eq_none", lambda: m_anchor("sqlglot/optimizer/simplify.py",
+                                                       "if new_expression is None:", "if new_expression == None:")),
     ]
 
 

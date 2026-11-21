@@ -16,6 +16,7 @@ COPY data/import_funcs.json /app/data/import_funcs.json
 COPY data/test_imports.json /app/data/test_imports.json
 COPY data/dialect_children.json /app/data/dialect_children.json
 COPY data/dialect_usage.json /app/data/dialect_usage.json
+COPY data/safe_cmps.json.gz /app/data/safe_cmps.json.gz
 COPY selector.py /app/selector.py
 # precompiled bytecode (the run's disk is read-only, so Python cannot cache it),
 # readable by user nobody at run time
