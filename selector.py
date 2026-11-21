@@ -17,8 +17,12 @@ import gzip
 import json
 import keyword
 import math
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -49,6 +53,20 @@ NOCOV_GATES = {
                  "tests/test_sqlglotc.py::TestSQLGlotC::test_editable_install_removes_obsolete_extensions"),
     "typing": ("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",),
 }
+# test_generator_memory is billed 6.7 s but really takes ~1 s of CPU and needs only
+# sqlglot: when it is what makes a commit expensive, run it here on the patched
+# code and drop it from the workers only if it passes cleanly.
+GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+GENMEM_UNITTEST = "tests.test_generator.TestGenerator.test_generator_memory"
+GENMEM_MIN_GAIN_MS = 1500
+GENMEM_TIMEOUT_S = 6
+GENMEM_CHILD = r"""
+import sys, unittest
+sys.path[:0] = [sys.argv[1], sys.argv[2]]  # patched sqlglot overlay first, then pinned tests
+suite = unittest.defaultTestLoader.loadTestsFromName(sys.argv[3])
+result = unittest.TextTestRunner(stream=open("/dev/null", "w"), verbosity=0).run(suite)
+sys.exit(0 if result.testsRun == 1 and result.wasSuccessful() else 1)
+"""
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -100,6 +118,15 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
 def duration_ms(seconds):
     """Exactly score.py's rounding (halves up), so packing math matches the scorer."""
     return math.floor(seconds * 1000 + 0.5)
+
+
+def split_cost_ms(tests):
+    """Simulated cost of the cheapest packing of `tests` [(ms, number)]."""
+    workers = best_split(tests)
+    if not workers:
+        return 0
+    loads = {n: ms for ms, n in tests}
+    return max(sum(loads[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)
 
 
 def fill_slack(workers, candidates, ms_of):
@@ -414,6 +441,7 @@ class Selector:
                      if not covered >> i & 1 and self.bit_to_number[i] is not None}
         nocov = {number_of[tid] for tid in m.get("nocov", []) if tid in number_of}
         self.always = uncovered | nocov | (self.all_numbers - mapped)
+        self.genmem = number_of.get(GENMEM_ID)
         # the no-coverage tests each depend on something specific (see NOCOV_GATES);
         # run them only when a change can reach that, instead of on every commit
         self.gated = {gate: {number_of[t] for t in ids if t in number_of} for gate, ids in NOCOV_GATES.items()}
@@ -469,6 +497,48 @@ class Selector:
                     d.setdefault(ln, set()).update(names)
             self._dialect_lines[rel] = d
         return self._dialect_lines[rel]
+
+    def verify_generator_memory(self, sel, why):
+        """Run test_generator_memory on the patched code when dropping it would
+        save > GENMEM_MIN_GAIN_MS; return `sel` without it only if it passed."""
+        gm = self.genmem
+        if gm is None or gm not in sel:
+            return sel
+        changes = [ch for ch in getattr(self, "last_changes", []) if ch.path]
+        if not changes or any(not (ch.path.startswith("sqlglot/") and ch.path.endswith(".py"))
+                              or ch.renamed or ch.binary or not ch.old_path or not ch.new_path
+                              for ch in changes):
+            return sel  # only plain sqlglot/*.py edits can be overlaid safely
+        timed = [(self.ms_of[n], n) for n in sel]
+        gain = split_cost_ms(timed) - split_cost_ms([t for t in timed if t[1] != gm])
+        if gain <= GENMEM_MIN_GAIN_MS:
+            return sel
+        overlay = None
+        try:
+            overlay = tempfile.mkdtemp(prefix="genmem-", dir="/tmp")
+            # whole pinned package (with build-time .pyc) + the patched files on top
+            shutil.copytree(SRC / "sqlglot", Path(overlay) / "sqlglot", copy_function=shutil.copy2)
+            for ch in changes:
+                base = self.base_file(ch.path)
+                if base is None:
+                    return sel
+                target = Path(overlay) / ch.path
+                target.write_text(ch.apply(base[0]), encoding="utf-8")
+                for stale in (target.parent / "__pycache__").glob(target.stem + ".*.pyc"):
+                    stale.unlink()  # never let an old .pyc stand in for the patched source
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, "-c", GENMEM_CHILD, overlay, str(SRC), GENMEM_UNITTEST],
+                               cwd=overlay, env=env, capture_output=True, timeout=GENMEM_TIMEOUT_S)
+            if r.returncode == 0:
+                why.append(f"genmem passed in-container: dropped (saves {gain / 1000:.2f}s)")
+                return sel - {gm}
+            why.append("genmem failed in-container: kept")
+        except Exception as e:  # timeout, copy error, anything: keep the test
+            why.append(f"genmem not verified ({type(e).__name__}): kept")
+        finally:
+            if overlay:
+                shutil.rmtree(overlay, ignore_errors=True)
+        return sel
 
     def usage_tests(self, name):
         """Tests whose text/fixtures mention dialect `name` (tools/build_dialect_usage.py)."""
@@ -822,6 +892,7 @@ class Selector:
         changes = parse_patch(text)
         sel, why, any_change = set(), [], False
         self.last_paths = [ch.path for ch in changes if ch.path]
+        self.last_changes = changes
         self.lazy_trigger = False
         self.real_change_paths = set()
         if text.strip() and not self.last_paths:
@@ -898,6 +969,7 @@ def main() -> None:
             try:
                 sel, why = selector.select_commit(patch.read_text(encoding="utf-8", errors="replace"))
                 if sel is not None:
+                    sel = selector.verify_generator_memory(sel, why)
                     workers = best_split([(selector.ms_of[n], n) for n in sel])
                     if len(workers) >= 2:  # a single worker has no idle time
                         before = len(sel)
