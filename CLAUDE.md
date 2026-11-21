@@ -32,6 +32,7 @@
 - NEVER run `git commit`, `git push`, or destructive git commands—we handle Git manually in Cursor's Source Control tab.
 
 ## Current State (Handoff to Tanush)
-- **Built & Verified:** 1-8 worker bin-packing + `data/map.json.gz` (0.32 MB) + `selector.py` safety fallbacks.
-- **Current Score:** 329.5 s local (`make sample`), 0 misses.
-- **Next Priority:** Tighten the module-level rule for `4d63`, `ktz3`, `6ze8`, and `gbav` (currently ~145 s of our 329.5 s) without causing any misses.
+- **Built & Verified:** 1–8 worker bin-packing + `data/map.json.gz` (0.32 MB) + `selector.py` safety fallbacks.
+- **Current Scores:** 329.5 s local (`make sample`, 0 misses) | **639.8 s live leaderboard** (0.44 s CPU, **1 missed commit** = ~339.3 s actual test time).
+- **Priority #1:** Find and eliminate the 1 hidden missed commit (-300 s) + add free slack-packing into idle worker time.
+- **Priority #2:** Tighten the module-level rule for `4d63`, `ktz3`, `6ze8`, and `gbav` (~145 s of our 329.5 s local cost) without adding misses.
