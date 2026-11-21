@@ -62,25 +62,45 @@ GENMEM_MIN_GAIN_MS = 2000  # ~1.8x its ~1.05 s CPU (kept)  # live CPU ran ~2.4x 
 GENMEM_TIMEOUT_S = 6
 LIGHT_MAX_TEST_MS = 600      # light verification: only tiny 1-worker selections
 LIGHT_MIN_GAIN_MS = 1500
-LIGHT_TIMEOUT_S = 3
+LIGHT_TIMEOUT_S = 6  # wider light selections (est <= 3.5 s) + dialect preload
 LIGHT_EXCLUDED_FILES = ("tests/test_optimizer.py", "tests/test_executor.py",  # duckdb/pandas + pools
                         "tests/test_sqlglotc.py", "tests/test_docs.py")
 LIGHT_CHILD = r"""
 import json, sys, unittest
 sys.path[:0] = [sys.argv[1], sys.argv[2]]  # patched sqlglot overlay first, then pinned tests
+import os
 names = json.loads(sys.argv[3])
-suite = unittest.TestSuite()
-for n in names:
-    suite.addTest(unittest.defaultTestLoader.loadTestsFromName(n))
-result = unittest.TextTestRunner(stream=open("/dev/null", "w"), verbosity=0).run(suite)
-bad = set()
-loader_error = False
-for test, _ in result.failures + result.errors:
-    case = getattr(test, "test_case", test)  # subtest failures fail their parent test
-    if type(case).__name__ in ("_FailedTest", "ModuleImportFailure", "_ErrorHolder"):
-        loader_error = True
-    bad.add(case.id())
-print(json.dumps({"ran": result.testsRun, "failed": sorted(bad), "loader_error": loader_error}))
+# subprocess-based tests (test_lazy_load runs `python -c "import sqlglot..."`) must import
+# the PATCHED package too
+os.environ["PYTHONPATH"] = os.pathsep.join([sys.argv[1], sys.argv[2]])
+LAZY = [n for n in names if n.endswith(".TestDialect.test_lazy_load")]
+REST = [n for n in names if n not in LAZY]
+ran, bad, loader_error = 0, set(), False
+
+
+def run(group):
+    global ran, loader_error
+    suite = unittest.TestSuite()
+    for n in group:
+        suite.addTest(unittest.defaultTestLoader.loadTestsFromName(n))
+    result = unittest.TextTestRunner(stream=open("/dev/null", "w"), verbosity=0).run(suite)
+    ran += result.testsRun
+    for test, _ in result.failures + result.errors:
+        case = getattr(test, "test_case", test)  # subtest failures fail their parent test
+        if type(case).__name__ in ("_FailedTest", "ModuleImportFailure", "_ErrorHolder"):
+            loader_error = True
+        bad.add(case.id())
+
+
+run(LAZY)  # first: before this process loads any dialect
+# then load every dialect, as the full suite has by the time e.g. test_enum runs (it
+# snapshots Dialect.classes); a patch that breaks a dialect makes this raise -> the
+# child exits non-zero and the commit keeps its full selection
+from sqlglot.dialects.dialect import Dialect, Dialects
+for _d in Dialects:
+    Dialect.get_or_raise(_d)
+run(REST)
+print(json.dumps({"ran": ran, "failed": sorted(bad), "loader_error": loader_error}))
 """
 GENMEM_CHILD = r"""
 import sys, unittest
@@ -131,6 +151,10 @@ MUTATORS = {"pop", "update", "append", "extend", "remove", "clear", "setdefault"
 # Lever A: Func attributes read at import (FUNCTION_BY_NAME) or before instantiation
 FUNC_NAME_ATTRS = {"_sql_names", "sql_names", "key", "is_var_len_args"}
 HEAVY_LINES_PATH = APP / "data" / "heavy_lines.json.gz"  # tools/build_heavy_lines.py
+LINE_MAP_PATH = APP / "data" / "line_map.json.gz"  # tools/build_full_lines.py (every fast test)
+# files that read annotations at run time (dataclasses, get_type_hints, ...)
+ANNOTATION_READERS = {"sqlglot/diff.py", "sqlglot/executor/env.py", "sqlglot/lineage.py",
+                      "sqlglot/optimizer/pushdown_projections.py", "sqlglot/_typing.py"}
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -507,6 +531,40 @@ def edited_statement_lines(rel, tree, removed, inserts):
     return out
 
 
+def _type_checking_test(node):
+    return (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING") or \
+        (isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING")
+
+
+def ast_equal_noanno(a, b):
+    """ast_equal, except annotations (parameter/return annotations, the annotation of an
+    AnnAssign) and the bodies of `if TYPE_CHECKING:` blocks may differ. Only valid for
+    modules with `from __future__ import annotations` that never read annotations."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.If) and _type_checking_test(a.test):
+        return _type_checking_test(b.test) and ast_equal_noanno(a.orelse, b.orelse)
+    skip = ()
+    if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        skip = ("returns",)
+    elif isinstance(a, ast.arg):
+        skip = ("annotation",)
+    elif isinstance(a, ast.AnnAssign):
+        skip = ("annotation",)
+    if isinstance(a, ast.AST):
+        return all(ast_equal_noanno(getattr(a, f, None), getattr(b, f, None)) for f in a._fields if f not in skip)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(ast_equal_noanno(x, y) for x, y in zip(a, b))
+    if isinstance(a, (float, complex)):
+        return repr(a) == repr(b)
+    return a == b
+
+
+def has_future_annotations(tree):
+    return any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+               for n in tree.body)
+
+
 def changed_classes(old_tree, new_tree):
     """Names of top-level classes whose bodies differ, if the edit is confined to
     class bodies (same top-level statements, same classes/bases/decorators);
@@ -745,6 +803,29 @@ class Selector:
             except (OSError, ValueError, KeyError):
                 self._heavy = {}
         dropped = set()
+        if not hasattr(self, "_lm"):
+            try:
+                self._lm = json.loads(gzip.decompress(LINE_MAP_PATH.read_bytes()))
+                self._lm_tests = [self.number_of.get(t) for t in self._lm["tests"]]
+                self._lm_protected = {(rel, ln) for rel, rngs in self._lm["protected"].items()
+                                      for a, b in rngs for ln in range(a, b + 1)}
+            except (OSError, ValueError, KeyError):
+                self._lm = None
+        if self._lm is not None:
+            if self.edit_lines & self._lm_protected:
+                why.append("line-level: edited lines also run at import/collection time: no drops")
+                return sel
+            reached = 0
+            for rel, ln in self.edit_lines:
+                sid = self._lm["lines"].get(rel, {}).get(str(ln))
+                if sid is not None:
+                    reached |= int(self._lm["sets"][sid], 16)
+            # never drop tests whose work happens in a subprocess or by reading source
+            # text (their trace is incomplete): the gated no-coverage tests
+            untraceable = set().union(*self.gated.values()) | self.always
+            for i, n in enumerate(self._lm_tests):
+                if n is not None and n in sel and n not in untraceable and not (reached >> i & 1):
+                    dropped.add(n)
         for n in sel & set(self._heavy):
             if n not in self._heavy_sets:
                 self._heavy_sets[n] = {(rel, ln) for rel, rngs in self._heavy[n].items()
@@ -782,22 +863,24 @@ class Selector:
         """Tiny 1-worker selection on a function-body-only edit: run it here on the
         patched code and emit only what actually fails ([] if nothing does). Any
         doubt (import error, exception, timeout) -> keep the full selection."""
-        if not sel or not getattr(self, "body_only", False):
+        if not sel:
             return sel
         changes = self.plain_source_changes()
         if changes is None:
             return sel
-        if sel & set().union(*self.gated.values()):
-            return sel  # subprocess / source-reading tests: not reproducible in-process
+        if sel & (self.gated["sqlglotc"] | self.gated["typing"]):
+            return sel  # build-tooling / source-reading tests: not reproduced in the child
+        # (test_lazy_load is verifiable: the child points its subprocess at the patched code)
         ids = {n: self.unittest_name(n) for n in sel}
         if any(name is None for name in ids.values()):
             return sel
         if any(self.test_file.get(n, "").startswith(LIGHT_EXCLUDED_FILES) for n in sel):
             return sel
         timed = [(self.ms_of[n], n) for n in sel]
-        if len(best_split(timed)) != 1 or sum(ms for ms, _ in timed) > LIGHT_MAX_TEST_MS:
-            return sel
-        if split_cost_ms(timed) <= LIGHT_MIN_GAIN_MS:
+        # estimated real CPU, fitted to measured in-container runs (gbav 1.21 s, 6ze8 0.61 s,
+        # ktz3 0.54 s): startup + ~0.5x the tests' simulated time + per-module imports
+        est = 0.30 + 0.5 * sum(ms for ms, _ in timed) / 1000 + 0.05 * len({self.test_file.get(n) for n in sel})
+        if est >= 0.55 * split_cost_ms(timed) / 1000 or est > 3.5:
             return sel
         overlay = None
         try:
@@ -1158,6 +1241,12 @@ class Selector:
         encoding_touched = any(ln <= 2 for ln in removed | inserts) and any("coding" in t for t in texts)
         if not encoding_touched and ast_equal(old_tree, new_tree):
             why.append(f"AST-identical (comment/whitespace only) {rel}")
+            return set()
+        if not encoding_touched and rel not in ANNOTATION_READERS and has_future_annotations(old_tree) \
+                and has_future_annotations(new_tree) and ast_equal_noanno(old_tree, new_tree):
+            # annotations are never evaluated here and nothing reads them back
+            self.real_change_paths.add(rel)
+            why.append(f"annotation/TYPE_CHECKING-only edit {rel}")
             return set()
         if not encoding_touched and ast_equal_nodoc(old_tree, new_tree):
             # only docstring text changed: sqlglot reads __doc__ solely to default it to ""
