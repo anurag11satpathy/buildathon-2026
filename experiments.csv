@@ -1,1 +1,2 @@
-v3-coverage-map,YOUR_HASH,Anurag,coverage map selector + safety fallbacks,329.5,LEADERBOARD_SCORE,0,CPU_SEC,keep
+version,commit_hash,owner,hypothesis_or_change,local_score,leaderboard_score,missed_commits,runtime_sec,keep_or_revert
+v3-coverage-map,1c4da6e,Anurag,coverage map selector + safety fallbacks,329.5,639.8,1 (live; 0 local),0.44,keep
