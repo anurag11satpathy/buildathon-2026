@@ -119,6 +119,10 @@ for d in (OUT, PROBE):
 shutil.copy("/tools_probe/sitecustomize.py", PROBE); shutil.copy("/tools_probe/heavy_plugin.py", PROBE)
 tests = json.load(open("/data_sample/tests.json"))["tests"]
 heavy = sorted(t["id"] for t in tests if t["seconds"] >= float(sys.argv[1]))
+ONLY = [x for x in sys.argv[3].split("|") if x] if len(sys.argv) > 3 else []
+JOBS = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+if ONLY:
+    heavy = [t for t in heavy if t in ONLY]
 env = dict(os.environ, HEAVY_OUT=OUT, HEAVY_TESTS="|".join(heavy), HEAVY_PKG="/pristine/sqlglot/",
            PYTHONPATH=f"{PROBE}:/pristine", PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0", PYTHON_CPU_COUNT="4")
 t = time.time()
@@ -133,7 +137,7 @@ def one(tid):
     return tid, subprocess.run([sys.executable, "-m", "pytest", tid, "-p", "heavy_plugin", "-p", "no:cacheprovider",
                                 "-q", "-o", "timeout=0", "--no-header"], cwd="/pristine", env=dict(env, HEAVY_OUT=d),
                                capture_output=True, text=True)
-with ThreadPoolExecutor(4) as ex:
+with ThreadPoolExecutor(JOBS) as ex:
     results = list(ex.map(one, heavy))
 rc = {tid: res.returncode for tid, res in results}
 bad = {tid: (res.returncode, res.stdout.strip().splitlines()[-2:]) for tid, res in results if res.returncode != 0}
@@ -157,6 +161,10 @@ def ranges(lines):
             out.append([ln, ln])
     return out
 data = {"tests": {ctx: {rel: ranges(v) for rel, v in sorted(files.items())} for ctx, files in sorted(merged.items())}}
+if ONLY and os.path.exists("/data_cur/heavy_lines.json.gz"):  # merge re-traced tests into the existing file
+    cur = json.loads(gzip.decompress(open("/data_cur/heavy_lines.json.gz", "rb").read()))
+    cur["tests"].update(data["tests"])
+    data = cur
 with gzip.open("/out/heavy_lines.json.gz", "wt") as f:
     json.dump(data, f, separators=(",", ":"))
 print(json.dumps({"pytest_exit": r.returncode, "tail": r.stdout, "nonzero_runs": bad, "heavy": len(heavy),
@@ -167,6 +175,9 @@ print(json.dumps({"pytest_exit": r.returncode, "tail": r.stdout, "nonzero_runs":
 
 
 def main():
+    # optional: python tools/build_heavy_lines.py <jobs> "<test id>|<test id>"  (re-trace + merge)
+    jobs = sys.argv[1] if len(sys.argv) > 1 else "4"
+    only = sys.argv[2] if len(sys.argv) > 2 else ""
     out = ROOT / "tools" / "out" / "heavy"
     out.mkdir(parents=True, exist_ok=True)
     (out / "sitecustomize.py").write_text(SITECUSTOMIZE, encoding="utf-8")
@@ -175,7 +186,8 @@ def main():
     cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
            "--memory", "5g", "--memory-swap", "5g", "--cpus", "8", "--pids-limit", "512",
            "-v", f"{out}:/tools_probe:ro", "-v", f"{out}:/out", "-v", f"{ROOT / 'sample'}:/data_sample:ro",
-           ORACLE_IMAGE, "python", "/tools_probe/inside.py", str(MIN_SECONDS)]
+           "-v", f"{ROOT / 'data'}:/data_cur:ro",
+           ORACLE_IMAGE, "python", "/tools_probe/inside.py", str(MIN_SECONDS), jobs, only]
     print("$ " + " ".join(cmd), file=sys.stderr)
     rc = subprocess.run(cmd).returncode
     src = out / "heavy_lines.json.gz"
