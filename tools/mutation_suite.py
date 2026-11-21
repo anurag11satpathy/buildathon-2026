@@ -417,6 +417,13 @@ def mutant_specs(rng):
         ("gd03", "guard_func_sql_names", lambda: m_anchor("sqlglot/expressions/functions.py",
                                                           '_sql_names = ["COALESCE", "IFNULL", "NVL"]',
                                                           '_sql_names = ["COALESCE", "IFNULL"]')),
+        # v17 dispatch-dict guardrails
+        ("gd04", "guard_dict_value", lambda: m_anchor("sqlglot/generator.py",
+                                                      'exp.CopyGrantsProperty: lambda *_: "COPY GRANTS",',
+                                                      'exp.CopyGrantsProperty: lambda *_: "COPY GRANT",')),
+        ("gd05", "guard_dict_import", lambda: m_anchor("sqlglot/generator.py",
+                                                       'exp.CopyTagsProperty: lambda *_: "COPY TAGS",',
+                                                       'exp.CopyTagsProperty: UNDEFINED_TRANSFORM_XYZ,')),
     ]
 
 
