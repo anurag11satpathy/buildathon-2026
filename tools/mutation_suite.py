@@ -381,6 +381,10 @@ def mutant_specs(rng):
                                                  "            sql, expression.sql(dialect=self.dialect, pretty=pretty, identify=identify)")),
         ("bs08", "base_attr_lambda", lambda: m_anchor("sqlglot/parser.py",
                                                       "    STRICT_CAST: t.ClassVar = True", "    STRICT_CAST: t.ClassVar = False")),
+        # v8d proof: fixture read only in TestExecutor.setUpClass (credited to test #1)
+        ("bs09", "fixture_setupclass", lambda: m_anchor("tests/fixtures/optimizer/tpc-h/tpc-h.sql",
+                                                        "date '1998-12-01' - interval '90' day",
+                                                        "date '1998-12-01' - interval '60' day")),
     ]
 
 

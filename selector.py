@@ -32,6 +32,9 @@ DIALECT_PKGS = ("dialects", "parsers", "generators", "typing")
 SHARED_DIALECT_MODULES = {"__init__", "dialect", "base"}
 # base classes every dialect inherits from: an attribute the map has no reader
 # for (read only in lambdas, via strings, or at class creation) -> run all
+# test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
+SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
+                       "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
 BASE_FILES = {"sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/tokens.py",
               "sqlglot/dialects/dialect.py", "sqlglot/expressions/core.py"}
 MAX_GUARDED_DIALECTS = 3
@@ -386,6 +389,14 @@ class Selector:
             self.imp = {"core": {}, "dialects": {}}
         self._core_lines, self._dialect_lines = {}, {}
         self._base, self._dialect_tests = {}, {}
+        # cov_plugin switches context per test, so whatever a class's setUpClass
+        # opens is credited to the class's first test (unittest runs test methods
+        # in alphabetical order): map that first test -> all tests of the class
+        self.setup_class_fanout = {}
+        for cls in SETUP_CLASS_CLASSES:
+            members = sorted(tid for tid in number_of if tid.startswith(cls + "::"))
+            if members:
+                self.setup_class_fanout[number_of[members[0]]] = {number_of[t] for t in members}
         try:  # tools/build_test_imports.py
             self.test_imports = json.loads(TEST_IMPORTS_PATH.read_text())
         except (OSError, ValueError) as e:
@@ -674,10 +685,12 @@ class Selector:
             any_change = True
             name = rel.rsplit("/", 1)[-1]
             if ch.renamed or ch.old_path is None or ch.new_path is None:
-                if rel.startswith(("sqlglot/", "tests/")) or rel.endswith(".py"):
-                    why.append(f"added/deleted/renamed {rel}")
-                    return None, why
-                continue
+                # any added/deleted/renamed file that is not plainly harmless (incl.
+                # root config like pyproject.toml / pytest.ini / setup.cfg) -> run all
+                if rel.startswith(HARMLESS_PREFIXES) or rel.endswith(HARMLESS_SUFFIXES) or rel in HARMLESS_FILES:
+                    continue
+                why.append(f"added/deleted/renamed {rel}")
+                return None, why
             if ch.binary:
                 if rel.startswith(HARMLESS_PREFIXES) or rel.endswith(HARMLESS_SUFFIXES):
                     continue
@@ -686,7 +699,11 @@ class Selector:
             if rel in self.m["files"]:
                 s = self.select_source(ch, why)
             elif rel in self.m["fixtures"]:
-                s = self.set_numbers(self.m["fixtures"][rel]); why.append(f"fixture {name}")
+                s = set(self.set_numbers(self.m["fixtures"][rel])); why.append(f"fixture {name}")
+                for first, members in self.setup_class_fanout.items():
+                    if first in s:  # opened in setUpClass: coverage credited only test #1
+                        s |= members
+                        why.append(f"setUpClass fixture -> whole class of {len(members)}")
             elif rel in self.m["testspans"]:
                 s = self.select_test_file(ch, why)
             elif rel.startswith("sqlglotc/"):
