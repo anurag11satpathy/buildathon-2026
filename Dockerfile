@@ -11,12 +11,16 @@ RUN mkdir -p /app/src \
  && rm /tmp/sqlglot.tar.gz \
  && test -f /app/src/sqlglot/__init__.py
 
+# pytz: needed by tests/dialects/test_bigquery.py for in-container light verification
+RUN pip install --no-cache-dir --root-user-action=ignore pytz==2026.6
+
 COPY data/map.json.gz /app/data/map.json.gz
 COPY data/import_funcs.json /app/data/import_funcs.json
 COPY data/test_imports.json /app/data/test_imports.json
 COPY data/dialect_children.json /app/data/dialect_children.json
 COPY data/dialect_usage.json /app/data/dialect_usage.json
 COPY data/safe_cmps.json.gz /app/data/safe_cmps.json.gz
+COPY data/expr_inst.json.gz /app/data/expr_inst.json.gz
 COPY selector.py /app/selector.py
 # precompiled bytecode (the run's disk is read-only, so Python cannot cache it),
 # readable by user nobody at run time

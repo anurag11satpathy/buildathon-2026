@@ -60,6 +60,28 @@ GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_UNITTEST = "tests.test_generator.TestGenerator.test_generator_memory"
 GENMEM_MIN_GAIN_MS = 2000  # live CPU ran ~2.4x local; every sample win saves >= 2.2 s
 GENMEM_TIMEOUT_S = 6
+LIGHT_MAX_TEST_MS = 600      # light verification: only tiny 1-worker selections
+LIGHT_MIN_GAIN_MS = 1500
+LIGHT_TIMEOUT_S = 3
+LIGHT_EXCLUDED_FILES = ("tests/test_optimizer.py", "tests/test_executor.py",  # duckdb/pandas + pools
+                        "tests/test_sqlglotc.py", "tests/test_docs.py")
+LIGHT_CHILD = r"""
+import json, sys, unittest
+sys.path[:0] = [sys.argv[1], sys.argv[2]]  # patched sqlglot overlay first, then pinned tests
+names = json.loads(sys.argv[3])
+suite = unittest.TestSuite()
+for n in names:
+    suite.addTest(unittest.defaultTestLoader.loadTestsFromName(n))
+result = unittest.TextTestRunner(stream=open("/dev/null", "w"), verbosity=0).run(suite)
+bad = set()
+loader_error = False
+for test, _ in result.failures + result.errors:
+    case = getattr(test, "test_case", test)  # subtest failures fail their parent test
+    if type(case).__name__ in ("_FailedTest", "ModuleImportFailure", "_ErrorHolder"):
+        loader_error = True
+    bad.add(case.id())
+print(json.dumps({"ran": result.testsRun, "failed": sorted(bad), "loader_error": loader_error}))
+"""
 GENMEM_CHILD = r"""
 import sys, unittest
 sys.path[:0] = [sys.argv[1], sys.argv[2]]  # patched sqlglot overlay first, then pinned tests
@@ -71,6 +93,8 @@ SAFE_CMPS_PATH = APP / "data" / "safe_cmps.json.gz"  # tools/build_cmp_profile.p
 # operator swaps a profiled site may be proven safe for (old op -> new op)
 SWAP_PAIRS = {("Is", "Eq"), ("Eq", "Is"), ("IsNot", "NotEq"), ("NotEq", "IsNot"),
               ("Lt", "LtE"), ("LtE", "Lt"), ("Gt", "GtE"), ("GtE", "Gt")}
+EXPR_INST_PATH = APP / "data" / "expr_inst.json.gz"  # tools/build_expr_inst.py
+INST_KEEP_CLASS_REFS = False  # also union refs(class) on top of instantiation evidence
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -476,6 +500,8 @@ class Selector:
         nocov = {number_of[tid] for tid in m.get("nocov", []) if tid in number_of}
         self.always = uncovered | nocov | (self.all_numbers - mapped)
         self.genmem = number_of.get(GENMEM_ID)
+        self.test_id = {n: tid for tid, n in number_of.items()}
+        self.test_file = {t["number"]: t["file"] for t in tests}
         # the no-coverage tests each depend on something specific (see NOCOV_GATES);
         # run them only when a change can reach that, instead of on every commit
         self.gated = {gate: {number_of[t] for t in ids if t in number_of} for gate, ids in NOCOV_GATES.items()}
@@ -537,16 +563,93 @@ class Selector:
             self._dialect_lines[rel] = d
         return self._dialect_lines[rel]
 
+    def plain_source_changes(self):
+        """Parsed changes if every one is a plain edit of an existing sqlglot/*.py."""
+        changes = [ch for ch in getattr(self, "last_changes", []) if ch.path]
+        if not changes or any(not (ch.path.startswith("sqlglot/") and ch.path.endswith(".py"))
+                              or ch.renamed or ch.binary or not ch.old_path or not ch.new_path
+                              for ch in changes):
+            return None
+        return changes
+
+    def make_overlay(self, changes):
+        """/tmp copy of the pinned sqlglot package (with build-time .pyc) + patched files."""
+        overlay = tempfile.mkdtemp(prefix="overlay-", dir="/tmp")
+        shutil.copytree(SRC / "sqlglot", Path(overlay) / "sqlglot", copy_function=shutil.copy2)
+        for ch in changes:
+            base = self.base_file(ch.path)
+            if base is None:
+                raise FileNotFoundError(ch.path)
+            target = Path(overlay) / ch.path
+            target.write_text(ch.apply(base[0]), encoding="utf-8")
+            for stale in (target.parent / "__pycache__").glob(target.stem + ".*.pyc"):
+                stale.unlink()  # never let an old .pyc stand in for the patched source
+        return overlay
+
+    def verify_light(self, sel, why):
+        """Tiny 1-worker selection on a function-body-only edit: run it here on the
+        patched code and emit only what actually fails ([] if nothing does). Any
+        doubt (import error, exception, timeout) -> keep the full selection."""
+        if not sel or not getattr(self, "body_only", False):
+            return sel
+        changes = self.plain_source_changes()
+        if changes is None:
+            return sel
+        if sel & set().union(*self.gated.values()):
+            return sel  # subprocess / source-reading tests: not reproducible in-process
+        ids = {n: self.unittest_name(n) for n in sel}
+        if any(name is None for name in ids.values()):
+            return sel
+        if any(self.test_file.get(n, "").startswith(LIGHT_EXCLUDED_FILES) for n in sel):
+            return sel
+        timed = [(self.ms_of[n], n) for n in sel]
+        if len(best_split(timed)) != 1 or sum(ms for ms, _ in timed) > LIGHT_MAX_TEST_MS:
+            return sel
+        if split_cost_ms(timed) <= LIGHT_MIN_GAIN_MS:
+            return sel
+        overlay = None
+        try:
+            overlay = self.make_overlay(changes)
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0")
+            r = subprocess.run([sys.executable, "-c", LIGHT_CHILD, overlay, str(SRC), json.dumps(sorted(ids.values()))],
+                               cwd=overlay, env=env, capture_output=True, text=True, timeout=LIGHT_TIMEOUT_S)
+            res = json.loads(r.stdout.strip().splitlines()[-1])
+            if res["loader_error"] or res["ran"] != len(ids):
+                why.append("light verification inconclusive: kept selection")
+                return sel
+            by_name = {v: k for k, v in ids.items()}
+            failed = set()
+            for name in res["failed"]:
+                if name not in by_name:
+                    why.append("light verification: unmapped failure, kept selection")
+                    return sel
+                failed.add(by_name[name])
+            why.append(f"light verification: {len(failed)}/{len(sel)} fail in-container")
+            return failed
+        except Exception as e:  # timeout, crash, bad output: keep everything
+            why.append(f"light verification not completed ({type(e).__name__}): kept selection")
+            return sel
+        finally:
+            if overlay:
+                shutil.rmtree(overlay, ignore_errors=True)
+
+    def unittest_name(self, n):
+        tid = self.test_id.get(n)
+        if not tid or tid.count("::") < 1:
+            return None
+        path, _, rest = tid.partition("::")
+        if "[" in rest:
+            return None  # parametrized ids have no unittest equivalent
+        return path[:-3].replace("/", ".") + "." + rest.replace("::", ".")
+
     def verify_generator_memory(self, sel, why):
         """Run test_generator_memory on the patched code when dropping it would
         save > GENMEM_MIN_GAIN_MS; return `sel` without it only if it passed."""
         gm = self.genmem
         if gm is None or gm not in sel:
             return sel
-        changes = [ch for ch in getattr(self, "last_changes", []) if ch.path]
-        if not changes or any(not (ch.path.startswith("sqlglot/") and ch.path.endswith(".py"))
-                              or ch.renamed or ch.binary or not ch.old_path or not ch.new_path
-                              for ch in changes):
+        changes = self.plain_source_changes()
+        if changes is None:
             return sel  # only plain sqlglot/*.py edits can be overlaid safely
         timed = [(self.ms_of[n], n) for n in sel]
         gain = split_cost_ms(timed) - split_cost_ms([t for t in timed if t[1] != gm])
@@ -554,17 +657,7 @@ class Selector:
             return sel
         overlay = None
         try:
-            overlay = tempfile.mkdtemp(prefix="genmem-", dir="/tmp")
-            # whole pinned package (with build-time .pyc) + the patched files on top
-            shutil.copytree(SRC / "sqlglot", Path(overlay) / "sqlglot", copy_function=shutil.copy2)
-            for ch in changes:
-                base = self.base_file(ch.path)
-                if base is None:
-                    return sel
-                target = Path(overlay) / ch.path
-                target.write_text(ch.apply(base[0]), encoding="utf-8")
-                for stale in (target.parent / "__pycache__").glob(target.stem + ".*.pyc"):
-                    stale.unlink()  # never let an old .pyc stand in for the patched source
+            overlay = self.make_overlay(changes)
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
             r = subprocess.run([sys.executable, "-c", GENMEM_CHILD, overlay, str(SRC), GENMEM_UNITTEST],
                                cwd=overlay, env=env, capture_output=True, timeout=GENMEM_TIMEOUT_S)
@@ -578,6 +671,48 @@ class Selector:
             if overlay:
                 shutil.rmtree(overlay, ignore_errors=True)
         return sel
+
+    def expr_inst(self):
+        """Lazily loaded: which tests instantiate each expression class (+ subclasses)."""
+        if not hasattr(self, "_expr_inst"):
+            try:
+                self._expr_inst = json.loads(gzip.decompress(EXPR_INST_PATH.read_bytes()))
+                self._expr_inst["import_time"] = set(self._expr_inst["import_time"])
+                self._expr_inst_index = {tid: i for i, tid in enumerate(self.m["tests"])}
+            except (OSError, ValueError) as e:
+                log(f"WARNING: expression instantiation map unavailable ({e!r})")
+                self._expr_inst = None
+        return self._expr_inst
+
+    def import_time_classes(self, old_tree, classes):
+        """Edited classes (or same-file subclasses) instantiated at import or collection
+        time, per the build-time map. Unknown map -> treat as yes (conservative)."""
+        inst = self.expr_inst()
+        if inst is None:
+            return True
+        tops = {n.name: n for n in old_tree.body if isinstance(n, ast.ClassDef)}
+        scope, grew = set(classes), True
+        while grew:
+            grew = False
+            for c, node in tops.items():
+                if c not in scope and {getattr(b, "id", getattr(b, "attr", None)) for b in node.bases} & scope:
+                    scope.add(c)
+                    grew = True
+        risky = inst["import_time"] | set(inst.get("collected_in", {}))
+        return sorted(scope & risky)
+
+    def inst_tests(self, cls):
+        inst = self._expr_inst
+        hexbits = inst["classes"].get(cls)
+        if hexbits is None:
+            return set()
+        b, out, i = int(hexbits, 16), set(), 0
+        while b:
+            if b & 1 and i < len(self.bit_to_number) and self.bit_to_number[i] is not None:
+                out.add(self.bit_to_number[i])
+            b >>= 1
+            i += 1
+        return out
 
     def usage_tests(self, name):
         """Tests whose text/fixtures mention dialect `name` (tools/build_dialect_usage.py)."""
@@ -646,10 +781,21 @@ class Selector:
                 if bn & FUNC_BASES:
                     return None
                 stack.extend(x for x in bn if x in tops)
-            out |= self.set_numbers(info["any"])
+            inst = self.expr_inst()
+            if inst is None or scope & (inst["import_time"] | set(inst.get("collected_in", {}))):
+                return None  # import-time classes are handled (run all) by the caller
             out |= self.usage_tests("__all__")  # e.g. test_generator_memory loads every dialect
-            for c in scope:
-                out |= self.refs(c) | self.sql_method_tests(f"{c.lower()}_sql")
+            if True:
+                # a class-body edit (arg_types, flags, ...) only matters where an instance
+                # of the class (or a subclass) exists: tests that instantiate it
+                for c in scope:
+                    out |= self.inst_tests(c) | self.sql_method_tests(f"{c.lower()}_sql")
+                    if INST_KEEP_CLASS_REFS:
+                        out |= self.refs(c)
+            else:
+                out |= self.set_numbers(info["any"])
+                for c in scope:
+                    out |= self.refs(c) | self.sql_method_tests(f"{c.lower()}_sql")
             for n in specific - set(classes):
                 out |= self.refs(n)
             why.append(f"class-body (expressions) {sorted(scope)[:4]} {sorted(specific - set(classes))[:3]}")
@@ -768,6 +914,7 @@ class Selector:
         for d in sorted(dialects):
             sel |= self.dialect_tests(d)
         if dialects:
+            self.body_only = False
             self.lazy_trigger = True
             why.append(f"import-time helper for {sorted(dialects)} in {rel}")
 
@@ -797,6 +944,7 @@ class Selector:
             why.append(f"defs added/removed in {rel}: {sorted(diff)[:3]}")
 
         if module_lines or def_names:
+            self.body_only = False
             self.lazy_trigger = True  # module/class-level code runs at import time
             tree = old_tree
             sel |= self.set_numbers(info["import"])
@@ -837,6 +985,12 @@ class Selector:
                     sel |= self.set_numbers(nxt[3])
             if rel in BASE_FILES and edited_targets and not any(t in self.m["refs"] for t in edited_targets):
                 why.append(f"base-file attribute with no known readers in {rel}: {sorted(edited_targets)[:4]}")
+                return None
+            if classes_changed and rel.startswith("sqlglot/expressions/") and self.import_time_classes(old_tree, classes_changed):
+                # instantiated while modules import (sqlglot's own module-level templates, or
+                # a test module's top level): a broken class can make whole test FILES fail
+                # to import, and which file triggers a shared import first is order-dependent
+                why.append(f"class-body edit of import-time-instantiated expression class(es) in {rel}")
                 return None
             narrowed = None
             if classes_changed:
@@ -940,6 +1094,7 @@ class Selector:
         self.last_changes = changes
         self.lazy_trigger = False
         self.real_change_paths = set()
+        self.body_only = True
         if text.strip() and not self.last_paths:
             why.append("non-empty patch with no recognisable file changes")
             return None, why
@@ -963,6 +1118,8 @@ class Selector:
                     continue
                 why.append(f"binary {rel}")
                 return None, why
+            if rel not in self.m["files"]:
+                self.body_only = False  # fixtures, test files, ...: not a function-body edit
             if rel in self.m["files"]:
                 s = self.select_source(ch, why)
             elif rel in self.m["fixtures"]:
@@ -1015,6 +1172,7 @@ def main() -> None:
                 sel, why = selector.select_commit(patch.read_text(encoding="utf-8", errors="replace"))
                 if sel is not None:
                     sel = selector.verify_generator_memory(sel, why)
+                    sel = selector.verify_light(sel, why)
                     workers = best_split([(selector.ms_of[n], n) for n in sel])
                     if len(workers) >= 2:  # a single worker has no idle time
                         before = len(sel)
