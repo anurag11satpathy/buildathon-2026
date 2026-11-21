@@ -107,15 +107,23 @@ sys.exit(0 if list(load_sql_fixture_pairs(sys.argv[3])) else 1)
 """
 # Lever D: patched dialect must import and build tokenizer/parser/generator cleanly
 DIALECT_IMPORT_CHILD = r"""
-import sys
+import json, sys
 sys.path[:0] = [sys.argv[1], sys.argv[2]]
-from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.dialect import Dialect  # an import failure here exits non-zero
+bad = []
 for name in sys.argv[3:]:
-    d = Dialect.get_or_raise(name)
-    d.tokenizer(); d.parser(); d.generator()
-    d.transpile("SELECT a, b FROM c WHERE d = 1")
+    try:
+        d = Dialect.get_or_raise(name)
+        d.tokenizer(); d.parser(); d.generator()
+        d.transpile("SELECT a, b FROM c WHERE d = 1")
+    except Exception:
+        bad.append(name)
+print(json.dumps(bad))
 """
-DIALECT_IMPORT_TIMEOUT_S = 6
+DIALECT_IMPORT_TIMEOUT_S = 15  # all-dialect checks import ~34 dialects; a timeout counts as failure
+# Dialects whose check fails on the PINNED code (they cannot parse a plain SELECT); measured
+# once at build time, so the runtime check needs no clean baseline run.
+CLEAN_FAILING_DIALECTS = frozenset({"dax", "prql"})
 REFS_EXTERNAL_PATH = APP / "data" / "refs_external.json.gz"  # tools/build_refs_external.py
 # methods that mutate shared objects: a class body calling them may change other classes
 MUTATORS = {"pop", "update", "append", "extend", "remove", "clear", "setdefault", "add",
@@ -964,8 +972,11 @@ class Selector:
         try:
             r = subprocess.run([sys.executable, "-c", DIALECT_IMPORT_CHILD, overlay, str(SRC), *fan],
                                cwd=overlay, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-                               capture_output=True, timeout=DIALECT_IMPORT_TIMEOUT_S)
-            return r.returncode == 0
+                               capture_output=True, text=True, timeout=DIALECT_IMPORT_TIMEOUT_S)
+            if r.returncode != 0:
+                return False  # the patched code does not even import
+            bad = set(json.loads(r.stdout.strip().splitlines()[-1]))
+            return bad <= CLEAN_FAILING_DIALECTS  # only dialects that already fail on pinned code
         except subprocess.TimeoutExpired:
             return False
         except Exception:
@@ -1282,6 +1293,14 @@ class Selector:
                 return func_sel | narrowed
             if narrowed is not None:
                 return sel | narrowed
+            # conservative path: if the patched module no longer imports/builds (e.g. an
+            # undefined name evaluated in a class body), every importer fails -> run all
+            changes_c = self.plain_source_changes()
+            if changes_c:
+                every = sorted(d for d in (self.dialect_usage or {}) if d != "__all__")
+                if self.verify_dialect_import(every, changes_c) is False:
+                    why.append(f"module/class-level edit in {rel} breaks import/build: run all")
+                    return None
             if classes_changed:  # conservative path: restore the next-function tests
                 for ln in module_lines:
                     nxt = min((f for f in funcs if f[0] > ln), key=lambda f: f[0], default=None)
