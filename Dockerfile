@@ -12,6 +12,7 @@ RUN mkdir -p /app/src \
  && test -f /app/src/sqlglot/__init__.py
 
 COPY data/map.json.gz /app/data/map.json.gz
+COPY data/import_funcs.json /app/data/import_funcs.json
 COPY selector.py /app/selector.py
 # readable by user nobody at run time
 RUN chmod -R a+rX /app

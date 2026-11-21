@@ -16,13 +16,17 @@ import ast
 import gzip
 import json
 import keyword
+import math
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
 MAP_PATH = APP / "data" / "map.json.gz"
+IMPORT_MAP_PATH = APP / "data" / "import_funcs.json"  # tools/trace_imports.py
+MAX_GUARDED_DIALECTS = 3
 SRC = APP / "src"  # pinned sqlglot checkout, downloaded at docker build time
 
 MAX_WORKERS = 8
@@ -63,6 +67,35 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
         if best_cost is None or cost < best_cost:
             best_cost, best_workers = cost, workers
     return [w for w in best_workers if w]
+
+
+def duration_ms(seconds):
+    """Exactly score.py's rounding (halves up), so packing math matches the scorer."""
+    return math.floor(seconds * 1000 + 0.5)
+
+
+def fill_slack(workers, candidates, ms_of):
+    """Add unselected tests into idle worker time for free: a test goes onto the
+    worker with the most room only if that worker's load stays <= the current
+    busiest load. Integer milliseconds, so the commit's cost is exactly unchanged.
+    Never adds a worker. `candidates` is in priority order."""
+    if len(workers) < 2:
+        return workers  # one worker (or none) has no idle time
+    workers = [list(w) for w in workers]
+    loads = [sum(ms_of[n] for n in w) for w in workers]
+    makespan = max(loads)
+    room = sum(makespan - x for x in loads)
+    for n in candidates:
+        if room <= 0:
+            break
+        d = ms_of[n]
+        i = loads.index(min(loads))  # most idle worker
+        if loads[i] + d <= makespan:
+            workers[i].append(n)
+            loads[i] += d
+            room -= d
+    assert max(loads) == makespan
+    return workers
 
 
 # ------------------------------------------------------------ patch parsing --
@@ -217,6 +250,68 @@ def module_level_context(tree, line):
     return classes, targets, is_import, header
 
 
+CLASS_HOOKS = {"__init_subclass__", "__set_name__", "__class_getitem__"}
+METACLASS_BASES = {"type", "ABCMeta", "EnumMeta", "EnumType"}
+
+
+def class_creation_hooks(tree):
+    """{qualname: ast.dump} of every function that runs when a class is created:
+    __init_subclass__/__set_name__/__class_getitem__ anywhere, and every method
+    of a metaclass (a class deriving from `type`, directly or through another
+    metaclass in this module). Coverage credits these to whichever test first
+    imported the class (or to none), so the map cannot be trusted for them."""
+    classes = []  # (qualname, ClassDef)
+
+    def collect(body, prefix):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                classes.append((prefix + node.name, node))
+                collect(node.body, prefix + node.name + ".")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                collect(node.body, prefix + node.name + ".")
+
+    collect(tree.body, "")
+
+    def base_name(b):
+        return b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else None
+
+    metas, grew = set(), True
+    while grew:  # fixpoint: metaclasses deriving from metaclasses defined here
+        grew = False
+        for _, c in classes:
+            if c.name not in metas and any(base_name(b) in METACLASS_BASES | metas for b in c.bases):
+                metas.add(c.name)
+                grew = True
+
+    hooks = {}
+    for qual, c in classes:
+        for f in c.body:
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and (c.name in metas or f.name in CLASS_HOOKS):
+                hooks[f"{qual}.{f.name}"] = ast.dump(f)
+    return hooks
+
+
+def defined_functions(tree):
+    """Counter of qualnames of functions/methods defined at module or class scope
+    (functions nested inside functions are part of their parent's body)."""
+    out = Counter()
+
+    def walk(body, prefix):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[prefix + node.name] += 1
+            elif isinstance(node, ast.ClassDef):
+                walk(node.body, prefix + node.name + ".")
+            elif isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(node, field, []), prefix)
+                for h in getattr(node, "handlers", []):
+                    walk(h.body, prefix)
+
+    walk(tree.body, "")
+    return out
+
+
 # ---------------------------------------------------------------- selector --
 
 class Selector:
@@ -226,7 +321,7 @@ class Selector:
         self._sets_hex = m["sets"]
         self._sets = {}
         number_of = {t["id"]: t["number"] for t in tests}
-        self.ms_of = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.ms_of = {t["number"]: duration_ms(t["seconds"]) for t in tests}
         # map bit position -> runtime test number (tests may be renumbered)
         self.bit_to_number = [number_of.get(tid) for tid in m["tests"]]
         self.all_numbers = set(self.ms_of)
@@ -243,6 +338,37 @@ class Selector:
         self.file_tests = {}
         for tid, n in number_of.items():
             self.file_tests.setdefault(tid.split("::", 1)[0], set()).add(n)
+        # function-body lines that run at import time (core, or per dialect)
+        try:
+            self.imp = json.loads(IMPORT_MAP_PATH.read_text())
+        except (OSError, ValueError) as e:
+            log(f"WARNING: import map unavailable ({e!r}); import-time helper guard disabled")
+            self.imp = {"core": {}, "dialects": {}}
+        self._core_lines, self._dialect_lines = {}, {}
+
+    def core_import_lines(self, rel):
+        if rel not in self._core_lines:
+            self._core_lines[rel] = {ln for s, e in self.imp["core"].get(rel, ()) for ln in range(s, e + 1)}
+        return self._core_lines[rel]
+
+    def dialect_import_lines(self, rel):
+        if rel not in self._dialect_lines:
+            d = {}
+            for s, e, names in self.imp["dialects"].get(rel, ()):
+                for ln in range(s, e + 1):
+                    d.setdefault(ln, set()).update(names)
+            self._dialect_lines[rel] = d
+        return self._dialect_lines[rel]
+
+    def dialect_tests(self, name):
+        """Tests that use a dialect: anything that ran its dialect/parser/generator/
+        typing module, plus its own test file."""
+        out = set(self.file_tests.get(f"tests/dialects/test_{name}.py", ()))
+        for pkg in ("dialects", "parsers", "generators", "typing"):
+            info = self.m["files"].get(f"sqlglot/{pkg}/{name}.py")
+            if info:
+                out |= self.set_numbers(info["any"])
+        return out
 
     def set_numbers(self, sid):
         if sid not in self._sets:
@@ -273,8 +399,21 @@ class Selector:
             why.append(f"no source for {rel}")
             return None
         new_text = ch.apply(old_text)
-        if not compiles(new_text, rel):
+        # parse each version once; reuse the trees below
+        try:
+            old_tree = ast.parse(old_text)
+            new_tree = ast.parse(new_text)
+            compile(new_tree, rel, "exec", dont_inherit=True)  # symtable errors too
+        except (SyntaxError, ValueError):
             why.append(f"syntax error in {rel}")
+            return None
+
+        # class-creation hooks affect every class they build: run everything
+        old_hooks = class_creation_hooks(old_tree)
+        new_hooks = class_creation_hooks(new_tree)
+        if old_hooks != new_hooks:
+            changed = sorted(k for k in old_hooks.keys() | new_hooks.keys() if old_hooks.get(k) != new_hooks.get(k))
+            why.append(f"class-creation hook changed in {rel}: {changed[:3]}")
             return None
 
         sel = set()
@@ -288,6 +427,23 @@ class Selector:
             return None
 
         removed, inserts, texts = ch.touched()
+
+        # helpers whose edited lines run while modules/classes are imported: the
+        # coverage map credits import-time work to no test
+        near = removed | inserts | {ln - 1 for ln in inserts}
+        if near & self.core_import_lines(rel):
+            why.append(f"import-time helper (core) changed in {rel}")
+            return None
+        dialect_lines = self.dialect_import_lines(rel)
+        dialects = set().union(*(dialect_lines.get(ln, ()) for ln in near))
+        if len(dialects) > MAX_GUARDED_DIALECTS:
+            why.append(f"import-time helper for {len(dialects)} dialects in {rel}")
+            return None
+        for d in sorted(dialects):
+            sel |= self.dialect_tests(d)
+        if dialects:
+            why.append(f"import-time helper for {sorted(dialects)} in {rel}")
+
         module_lines = set()
         for ln in removed:
             f = func_at(ln)
@@ -302,15 +458,27 @@ class Selector:
             if not fs:
                 module_lines.add(ln)
 
-        if module_lines:
-            tree = ast.parse(old_text)
+        # an added/removed/renamed function or method changes what the class
+        # offers (e.g. a new *_sql override changes generator dispatch), which the
+        # neighbouring function's coverage says nothing about: go class-level
+        old_defs, new_defs = defined_functions(old_tree), defined_functions(new_tree)
+        def_names = set()
+        if old_defs != new_defs:
+            diff = (old_defs - new_defs) + (new_defs - old_defs)
+            for qual in diff:
+                def_names |= set(qual.split("."))
+            why.append(f"defs added/removed in {rel}: {sorted(diff)[:3]}")
+
+        if module_lines or def_names:
+            tree = old_tree
             sel |= self.set_numbers(info["import"])
-            if ast.dump(tree) == ast.dump(ast.parse(new_text)):
+            if not def_names and ast.dump(tree) == ast.dump(new_tree):
                 # comments/blank lines only: code is identical, only line numbers
                 # and source text move (source readers are already in `sel`)
                 why.append(f"module-level comment-only in {rel}")
                 return sel
             names = {n for t in texts for n in IDENT.findall(t.split("#", 1)[0]) if not keyword.iskeyword(n)}
+            names |= def_names
             if any(t.lstrip().startswith(("import ", "from ")) for t in texts):
                 why.append(f"import change in {rel}")
                 return None
@@ -371,10 +539,35 @@ class Selector:
                     self._ids_by_file.setdefault(tid.split("::", 1)[0], []).append((tid, n))
         return self._ids_by_file.get(rel, [])
 
+    def slack_candidates(self, sel):
+        """Unselected tests in the order we want them packed into idle time:
+        (a) tests that ran any line of a changed file, (b) the changed dialect's
+        own test file, (c) everything else; shortest first within each tier so
+        each idle second holds as many extra checks as possible."""
+        tier_a, tier_b = set(), set()
+        for rel in getattr(self, "last_paths", []):
+            info = self.m["files"].get(rel)
+            if info:
+                tier_a |= self.set_numbers(info["any"])
+            parts = rel.split("/")
+            if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "parsers", "generators", "typing"):
+                tier_b |= self.file_tests.get(f"tests/dialects/test_{parts[2][:-3]}.py", set())
+            elif rel in self.m["testspans"]:
+                tier_a |= self.file_tests.get(rel, set())
+        tier_a -= sel
+        tier_b -= sel | tier_a
+        if not hasattr(self, "_by_duration"):
+            self._by_duration = sorted(self.all_numbers, key=lambda n: (self.ms_of[n], n))
+        taken = sel | tier_a | tier_b
+        key = lambda n: (self.ms_of[n], n)  # noqa: E731
+        return (sorted(tier_a, key=key) + sorted(tier_b, key=key)
+                + [n for n in self._by_duration if n not in taken])
+
     def select_commit(self, text):
         """Return (set of test numbers, reasons). None in place of the set = run all."""
         changes = parse_patch(text)
         sel, why, any_change = set(), [], False
+        self.last_paths = [ch.path for ch in changes if ch.path]
         for ch in changes:
             rel = ch.path
             if rel is None:
@@ -417,7 +610,7 @@ class Selector:
 
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    all_numbers = [(round(t["seconds"] * 1000), t["number"]) for t in tests]
+    all_numbers = [(duration_ms(t["seconds"]), t["number"]) for t in tests]
     all_workers = best_split(all_numbers)
     try:
         selector = Selector(tests)
@@ -432,6 +625,10 @@ def main() -> None:
                 sel, why = selector.select_commit(patch.read_text(encoding="utf-8", errors="replace"))
                 if sel is not None:
                     workers = best_split([(selector.ms_of[n], n) for n in sel])
+                    if len(workers) >= 2:  # a single worker has no idle time
+                        before = len(sel)
+                        workers = fill_slack(workers, selector.slack_candidates(sel), selector.ms_of)
+                        why.append(f"slack +{sum(map(len, workers)) - before} free tests")
                 log(f"{patch.stem}: {'ALL' if sel is None else len(sel)} tests, "
                     f"{len(workers)} workers; {sorted(set(why))[:5]}")
             except Exception as e:
