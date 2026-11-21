@@ -32,6 +32,23 @@ DIALECT_PKGS = ("dialects", "parsers", "generators", "typing")
 SHARED_DIALECT_MODULES = {"__init__", "dialect", "base"}
 # base classes every dialect inherits from: an attribute the map has no reader
 # for (read only in lambdas, via strings, or at class creation) -> run all
+DIALECT_USAGE_PATH = APP / "data" / "dialect_usage.json"  # tools/build_dialect_usage.py
+# names too generic to say anything about which tests an edit affects
+GENERIC_NAMES = {"Tokenizer", "Parser", "Generator", "arg_types", "args", "this", "Expr",
+                 "Expression", "self", "cls", "exp", "e", "t", "TokenType", "key", "name"}
+FUNC_BASES = {"Func", "AggFunc"}  # parsed by SQL function name via class-creation tables
+# The no-coverage tests and what can make each fail (read from their source):
+#  lazy_load : runs `import sqlglot` in a subprocess and asserts only one dialect
+#              got loaded -> anything that can change import-time behaviour
+#  sqlglotc  : runpy's sqlglotc/setup.py (it only os.listdir()s sqlglot file names)
+#  typing    : ast.parse()s sqlglot/typing/*.py and compares EXPRESSION_METADATA
+NOCOV_GATES = {
+    "lazy_load": ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",),
+    "sqlglotc": ("tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions",
+                 "tests/test_sqlglotc.py::TestSQLGlotC::test_dry_run_preserves_obsolete_extensions",
+                 "tests/test_sqlglotc.py::TestSQLGlotC::test_editable_install_removes_obsolete_extensions"),
+    "typing": ("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",),
+}
 # test classes with setUpClass at the pinned commit (tests/ has no setUpModule)
 SETUP_CLASS_CLASSES = ("tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
                        "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC")
@@ -292,6 +309,26 @@ def ast_equal(a, b):
     return a == b
 
 
+def changed_classes(old_tree, new_tree):
+    """Names of top-level classes whose bodies differ, if the edit is confined to
+    class bodies (same top-level statements, same classes/bases/decorators);
+    otherwise None."""
+    a, b = old_tree.body, new_tree.body
+    if len(a) != len(b):
+        return None
+    changed = []
+    for x, y in zip(a, b):
+        if isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef):
+            if x.name != y.name or not all(ast_equal(getattr(x, f), getattr(y, f))
+                                           for f in ("bases", "keywords", "decorator_list")):
+                return None
+            if not ast_equal(x.body, y.body):
+                changed.append(x.name)
+        elif not ast_equal(x, y):
+            return None
+    return changed
+
+
 def changed_hooks(old, new):
     return sorted(k for k in old.keys() | new.keys()
                   if k not in old or k not in new or not ast_equal(old[k], new[k]))
@@ -377,6 +414,10 @@ class Selector:
                      if not covered >> i & 1 and self.bit_to_number[i] is not None}
         nocov = {number_of[tid] for tid in m.get("nocov", []) if tid in number_of}
         self.always = uncovered | nocov | (self.all_numbers - mapped)
+        # the no-coverage tests each depend on something specific (see NOCOV_GATES);
+        # run them only when a change can reach that, instead of on every commit
+        self.gated = {gate: {number_of[t] for t in ids if t in number_of} for gate, ids in NOCOV_GATES.items()}
+        self.always_rest = self.always - set().union(*self.gated.values())
         log(f"map: {len(m['tests'])} tests, always-run (no coverage): {sorted(self.always)}")
         self.file_tests = {}
         for tid, n in number_of.items():
@@ -403,6 +444,13 @@ class Selector:
             log(f"WARNING: test import graph unavailable ({e!r}); helper edits select own file only")
             self.test_imports = {}
         try:
+            self.dialect_usage = json.loads(DIALECT_USAGE_PATH.read_text())
+        except (OSError, ValueError) as e:
+            log(f"WARNING: dialect usage map unavailable ({e!r}); class-body narrowing disabled")
+            self.dialect_usage = None
+        self._usage = {}
+        self._sql_methods = None
+        try:
             self.dialect_children = json.loads(DIALECT_CHILDREN_PATH.read_text())
         except (OSError, ValueError) as e:
             log(f"WARNING: dialect children map unavailable ({e!r}); parent edits select own dialect only")
@@ -421,6 +469,83 @@ class Selector:
                     d.setdefault(ln, set()).update(names)
             self._dialect_lines[rel] = d
         return self._dialect_lines[rel]
+
+    def usage_tests(self, name):
+        """Tests whose text/fixtures mention dialect `name` (tools/build_dialect_usage.py)."""
+        if name not in self._usage:
+            self._usage[name] = frozenset(self.bit_to_number[i] for i in self.dialect_usage.get(name, ())
+                                          if self.bit_to_number[i] is not None)
+        return self._usage[name]
+
+    def sql_method_tests(self, method):
+        """Tests that ran any `<method>` (e.g. triggerproperties_sql) in any module:
+        generators dispatch on expression.key, which no `refs` entry records."""
+        if self._sql_methods is None:
+            self._sql_methods = {}
+            for finfo in self.m["files"].values():
+                for _, _, qual, sid in finfo["funcs"]:
+                    last = qual.rsplit(".", 1)[-1]
+                    if last.endswith("_sql"):
+                        self._sql_methods.setdefault(last, []).append(sid)
+        out = set()
+        for sid in self._sql_methods.get(method, ()):
+            out |= self.set_numbers(sid)
+        return out
+
+    def class_body_selection(self, rel, info, old_tree, classes, def_names, edited_targets, why):
+        """Phase 2 narrowing for an edit confined to class bodies. Returns the
+        extra tests to select, or None to keep the conservative rule."""
+        if self.dialect_usage is None or rel in BASE_FILES or not classes:
+            return None
+        specific = (set(classes) | def_names | edited_targets) - GENERIC_NAMES
+        parts = rel.split("/")
+        out = set()
+        if len(parts) == 3 and parts[1] in DIALECT_PKGS and parts[2][:-3] not in SHARED_DIALECT_MODULES:
+            # a dialect's own class attributes only matter when that dialect (or one
+            # inheriting/reusing it) runs: tests that run or name those dialects
+            fan = [parts[2][:-3]] + self.dialect_children.get(parts[2][:-3], [])
+            for d in fan:
+                out |= self.dialect_tests(d) | self.usage_tests(d)
+            out |= self.usage_tests("__all__")
+            for n in (set(classes) | def_names) - GENERIC_NAMES:
+                out |= self.refs(n)
+            why.append(f"class-body (dialect {fan}) {sorted(specific)[:4]}")
+            return out
+        if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] == "expressions":
+            # expression classes: tests that reference the class (and same-file
+            # subclasses) or run its key-dispatched *_sql method; Func subclasses are
+            # also reached by SQL function name, so keep those conservative
+            tops = {n.name: n for n in old_tree.body if isinstance(n, ast.ClassDef)}
+
+            def base_names(c):
+                return {b.id if isinstance(b, ast.Name) else getattr(b, "attr", None) for b in tops[c].bases}
+
+            scope, grew = set(classes), True
+            while grew:
+                grew = False
+                for c in tops:
+                    if c not in scope and base_names(c) & scope:
+                        scope.add(c)
+                        grew = True
+            seen, stack = set(), list(scope)
+            while stack:  # ancestors inside this file, to spot Func subclasses
+                c = stack.pop()
+                if c in seen:
+                    continue
+                seen.add(c)
+                bn = base_names(c)
+                if bn & FUNC_BASES:
+                    return None
+                stack.extend(x for x in bn if x in tops)
+            out |= self.set_numbers(info["any"])
+            out |= self.usage_tests("__all__")  # e.g. test_generator_memory loads every dialect
+            for c in scope:
+                out |= self.refs(c) | self.sql_method_tests(f"{c.lower()}_sql")
+            for n in specific - set(classes):
+                out |= self.refs(n)
+            why.append(f"class-body (expressions) {sorted(scope)[:4]} {sorted(specific - set(classes))[:3]}")
+            return out
+        return None
 
     def base_file(self, rel):
         """(text, tree, class-creation hooks, defined functions) of the pinned
@@ -487,6 +612,15 @@ class Selector:
             why.append(f"syntax error in {rel}")
             return None
 
+        removed, inserts, texts = ch.touched()
+        # a pure comment/whitespace edit: the code is identical. Only an encoding
+        # declaration (first two lines) can change how the bytes are read.
+        encoding_touched = any(ln <= 2 for ln in removed | inserts) and any("coding" in t for t in texts)
+        if not encoding_touched and ast_equal(old_tree, new_tree):
+            why.append(f"AST-identical (comment/whitespace only) {rel}")
+            return set()
+        self.real_change_paths.add(rel)
+
         # class-creation hooks affect every class they build: run everything
         new_hooks = class_creation_hooks(new_tree)
         changed = changed_hooks(old_hooks, new_hooks)
@@ -504,7 +638,6 @@ class Selector:
                     return qual, sid
             return None
 
-        removed, inserts, texts = ch.touched()
 
         # helpers whose edited lines run while modules/classes are imported: the
         # coverage map credits import-time work to no test
@@ -520,6 +653,7 @@ class Selector:
         for d in sorted(dialects):
             sel |= self.dialect_tests(d)
         if dialects:
+            self.lazy_trigger = True
             why.append(f"import-time helper for {sorted(dialects)} in {rel}")
 
         module_lines = set()
@@ -548,6 +682,7 @@ class Selector:
             why.append(f"defs added/removed in {rel}: {sorted(diff)[:3]}")
 
         if module_lines or def_names:
+            self.lazy_trigger = True  # module/class-level code runs at import time
             tree = old_tree
             sel |= self.set_numbers(info["import"])
             if not def_names and ast_equal(tree, new_tree):
@@ -561,6 +696,7 @@ class Selector:
                 why.append(f"import change in {rel}")
                 return None
             edited_targets = set()
+            classes_changed = changed_classes(tree, new_tree)
             for ln in module_lines:
                 ctx_here = module_level_context(tree, ln)
                 ctx_prev = module_level_context(tree, ln - 1)
@@ -579,12 +715,25 @@ class Selector:
                             if qual == header:
                                 sel |= self.set_numbers(sid)
                 # nearest following function (covers def/decorator lines)
+                # (inside class bodies, def/decorator lines are covered via `header`;
+                # the next-function tests are added below only on the conservative path)
                 nxt = min((f for f in funcs if f[0] > ln), key=lambda f: f[0], default=None)
-                if nxt:
+                if nxt and not classes_changed:
                     sel |= self.set_numbers(nxt[3])
             if rel in BASE_FILES and edited_targets and not any(t in self.m["refs"] for t in edited_targets):
                 why.append(f"base-file attribute with no known readers in {rel}: {sorted(edited_targets)[:4]}")
                 return None
+            narrowed = None
+            if classes_changed:
+                narrowed = self.class_body_selection(rel, info, tree, classes_changed,
+                                                     def_names, edited_targets, why)
+            if narrowed is not None:
+                return sel | narrowed
+            if classes_changed:  # conservative path: restore the next-function tests
+                for ln in module_lines:
+                    nxt = min((f for f in funcs if f[0] > ln), key=lambda f: f[0], default=None)
+                    if nxt:
+                        sel |= self.set_numbers(nxt[3])
             for n in names:
                 sel |= self.refs(n)
             # a class-body edit in a dialect module changes that dialect and every
@@ -673,6 +822,8 @@ class Selector:
         changes = parse_patch(text)
         sel, why, any_change = set(), [], False
         self.last_paths = [ch.path for ch in changes if ch.path]
+        self.lazy_trigger = False
+        self.real_change_paths = set()
         if text.strip() and not self.last_paths:
             why.append("non-empty patch with no recognisable file changes")
             return None, why
@@ -718,7 +869,16 @@ class Selector:
                 return None, why
             sel |= s
         if any_change:
-            sel |= self.always
+            sel |= self.always_rest
+            paths = set(self.last_paths)
+            if self.lazy_trigger or "tests/dialects/test_dialect.py" in paths or any(
+                    p.startswith("sqlglot/") and p.endswith("__init__.py") for p in paths):
+                sel |= self.gated["lazy_load"]
+            if any(p.startswith("sqlglotc/") or p == "tests/test_sqlglotc.py" for p in paths):
+                sel |= self.gated["sqlglotc"]
+            if "tests/test_typing.py" in paths or any(
+                    p.startswith(("sqlglot/typing/", "sqlglot/expressions/")) for p in self.real_change_paths):
+                sel |= self.gated["typing"]
         return sel, why
 
 

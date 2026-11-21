@@ -1,7 +1,7 @@
 """Offline only: which dialects inherit from which (pinned sqlglot).
 
 A class-body edit in a parent dialect (e.g. MySQL) changes every child dialect
-that inherits the attribute (SingleStore, Doris, StarRocks, ...). For each
+that inherits (or explicitly reuses) the attribute (SingleStore, Doris, StarRocks, ...). For each
 dialect name, records all transitive children, using class inheritance across
 sqlglot/{dialects,parsers,generators,typing}/<name>.py (e.g. `class
 SingleStore(MySQL)`, `class SingleStoreParser(MySQLParser)`).
@@ -37,6 +37,13 @@ def main():
                         name = b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else None
                         if name:
                             bases.append((p.stem, name))
+            # also any reference to another dialect's top-level class (e.g. a class body
+            # copying `Hive.Generator.TRANSFORMS` without inheriting from Hive)
+            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Name):
+                    bases.append((p.stem, node.id))
+                elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                    bases.append((p.stem, node.value.id))
     direct = {}
     for child, base in bases:
         parent = defined.get(base)

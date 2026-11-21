@@ -385,6 +385,16 @@ def mutant_specs(rng):
         ("bs09", "fixture_setupclass", lambda: m_anchor("tests/fixtures/optimizer/tpc-h/tpc-h.sql",
                                                         "date '1998-12-01' - interval '90' day",
                                                         "date '1998-12-01' - interval '60' day")),
+        # v9 stress tests (class-body narrowing assumptions)
+        ("sm01", "v9_fixture_dialect", lambda: m_anchor("sqlglot/dialects/bigquery.py",
+                                                        "NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE_EXCEPT_TABLES",
+                                                        "NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE")),
+        ("sm02", "v9_reused_parent", lambda: m_anchor("sqlglot/dialects/hive.py",
+                                                      '"yyyy": "%Y",', '"yyyy": "%y",')),
+        ("sm03", "v9_expr_class_body", lambda: m_anchor("sqlglot/expressions/query.py",
+                                                        '"match_condition": False,', '"match_condition": True,')),
+        ("sm04", "v9_alias_dialect", lambda: m_anchor("sqlglot/generators/trino.py",
+                                                      "SUPPORTS_LEFT_JOIN_UNNEST = True", "SUPPORTS_LEFT_JOIN_UNNEST = False")),
     ]
 
 
@@ -539,7 +549,7 @@ def main():
     ap.add_argument("cmd", choices=["build", "gen", "oracle", "select", "validate"])
     ap.add_argument("--suite", default="mutants")
     ap.add_argument("--only", default="")
-    ap.add_argument("--workers", default="6")
+    ap.add_argument("--workers", default="3")  # 6 made test_execute_tpcds flaky (pool workers starved)
     args = ap.parse_args()
     sys.exit({"build": cmd_build, "gen": cmd_gen, "oracle": cmd_oracle,
               "select": cmd_select, "validate": cmd_validate}[args.cmd](args) or 0)
