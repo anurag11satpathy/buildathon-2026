@@ -58,7 +58,7 @@ NOCOV_GATES = {
 # code and drop it from the workers only if it passes cleanly.
 GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_UNITTEST = "tests.test_generator.TestGenerator.test_generator_memory"
-GENMEM_MIN_GAIN_MS = 1500
+GENMEM_MIN_GAIN_MS = 2000  # live CPU ran ~2.4x local; every sample win saves >= 2.2 s
 GENMEM_TIMEOUT_S = 6
 GENMEM_CHILD = r"""
 import sys, unittest

@@ -38,9 +38,14 @@ def main():
     patterns = {d: re.compile(rf"\b{re.escape(d)}\b", re.I) for d in names}
     index = {tid: i for i, tid in enumerate(m["tests"])}
 
-    def dialects_in(text):
+    def dialects_in(numbered):
+        """numbered = [(line number, text)]. A dialect name anywhere counts (even on an
+        import line: importing Snowflake means using it); "__all__" only counts outside
+        import statements, so `from sqlglot.dialects import Dialects` at the top of a
+        file does not tag every test in it as iterating over all dialects."""
+        text = "\n".join(t for _, t in numbered)
         found = {d for d, p in patterns.items() if p.search(text)}
-        if ALL_PATTERN.search(text):
+        if any(ALL_PATTERN.search(t) for ln, t in numbered if ln not in import_lines):
             found.add("__all__")
         return found
 
@@ -56,6 +61,8 @@ def main():
         lines = path.read_text(encoding="utf-8").splitlines()
         spans = m["testspans"].get(rel, [])
         tree = ast.parse("\n".join(lines))
+        import_lines = {ln for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+                        for ln in range(node.lineno, (node.end_lineno or node.lineno) + 1)}
         in_test = set()
         for s, e, qual in spans:
             if qual.rsplit("::", 1)[-1].startswith("test"):
@@ -66,17 +73,17 @@ def main():
             if isinstance(node, ast.ClassDef):
                 rng = range(node.lineno, node.end_lineno + 1)
                 class_lines.update(rng)
-                class_text[node.name] = "\n".join(lines[i - 1] for i in rng if i not in in_test)
-        module_text = "\n".join(l for i, l in enumerate(lines, 1) if i not in class_lines)
+                class_text[node.name] = [(i, lines[i - 1]) for i in rng if i not in in_test]
+        module_text = [(i, l) for i, l in enumerate(lines, 1) if i not in class_lines]
         file_wide = dialects_in(module_text)
         for tid in tids:
             parts = tid.split("::")
             cls = parts[1] if len(parts) > 2 else None
             qual = "::".join(parts[1:3]) if len(parts) > 2 else parts[1]
-            found = set(file_wide) | dialects_in(class_text.get(cls, ""))
+            found = set(file_wide) | dialects_in(class_text.get(cls, []))
             for s, e, q in spans:
                 if q == qual:
-                    found |= dialects_in("\n".join(lines[s - 1:e]))
+                    found |= dialects_in([(i, lines[i - 1]) for i in range(s, e + 1)])
             for d in found:
                 usage[d].add(index[tid])
 
@@ -85,7 +92,8 @@ def main():
         p = src / rel
         if not p.exists() or p.suffix == ".gz":
             continue
-        found = dialects_in(p.read_text(encoding="utf-8", errors="replace"))
+        import_lines = set()
+        found = dialects_in(list(enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1)))
         if not found:
             continue
         b = int(m["sets"][sid], 16)
