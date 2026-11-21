@@ -30,3 +30,8 @@
 - Before editing multiple files or making big architectural changes, outline a short step-by-step plan and wait for our confirmation.
 - Make one targeted change at a time so we can measure whether it improved the score.
 - NEVER run `git commit`, `git push`, or destructive git commands—we handle Git manually in Cursor's Source Control tab.
+
+## Current State (Handoff to Tanush)
+- **Built & Verified:** 1-8 worker bin-packing + `data/map.json.gz` (0.32 MB) + `selector.py` safety fallbacks.
+- **Current Score:** 329.5 s local (`make sample`), 0 misses.
+- **Next Priority:** Tighten the module-level rule for `4d63`, `ktz3`, `6ze8`, and `gbav` (currently ~145 s of our 329.5 s) without causing any misses.

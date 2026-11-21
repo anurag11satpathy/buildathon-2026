@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+output.jsonl
+# Blast Radius local artifacts
+sqlglot-src/
+tools/out/
