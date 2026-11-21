@@ -360,6 +360,27 @@ def mutant_specs(rng):
         ("fb04", "func_body", lambda: m_compare_flip("sqlglot/optimizer/qualify_columns.py", r())),
         ("fb05", "func_body", lambda: m_compare_flip("sqlglot/helper.py", r())),
         ("fb06", "func_body", lambda: m_compare_flip("sqlglot/transforms.py", r())),
+        # Blind-spot audit after v7 live (appended last so earlier rng picks stay identical)
+        ("bs01", "attr_lambda_only", lambda: m_anchor("sqlglot/parsers/drill.py",
+                                                      "    STRICT_CAST = False", "    STRICT_CAST = True")),
+        ("bs02", "tokenizer_attr", lambda: m_anchor("sqlglot/dialects/drill.py",
+                                                    '        IDENTIFIERS = ["`"]', "        IDENTIFIERS = ['\"']")),
+        ("bs03", "transforms_lambda", lambda: m_anchor("sqlglot/generators/drill.py",
+                                                       'self.func("TO_TIMESTAMP", e.this, self.format_time(e))',
+                                                       'self.func("TO_TIMESTAMP_TZ", e.this, self.format_time(e))')),
+        ("bs04", "attr_lambda_only", lambda: m_anchor("sqlglot/parsers/snowflake.py",
+                                                      "COLON_PLACEHOLDER_TOKENS = ID_VAR_TOKENS | {TokenType.NUMBER}",
+                                                      "COLON_PLACEHOLDER_TOKENS = ID_VAR_TOKENS")),
+        ("bs05", "setupclass_func", lambda: m_anchor("sqlglot/schema.py",
+                                                     "self.normalize: bool = normalize", "self.normalize: bool = not normalize")),
+        ("bs06", "parent_dialect_attr", lambda: m_anchor("sqlglot/dialects/mysql.py",
+                                                         "    DPIPE_IS_STRING_CONCAT = False", "    DPIPE_IS_STRING_CONCAT = True")),
+        # v8 proofs: shared test helper (Validator) and a base-file lambda-only attribute
+        ("bs07", "test_helper", lambda: m_anchor("tests/dialects/test_dialect.py",
+                                                 "            write_sql or sql, expression.sql(dialect=self.dialect, pretty=pretty, identify=identify)",
+                                                 "            sql, expression.sql(dialect=self.dialect, pretty=pretty, identify=identify)")),
+        ("bs08", "base_attr_lambda", lambda: m_anchor("sqlglot/parser.py",
+                                                      "    STRICT_CAST: t.ClassVar = True", "    STRICT_CAST: t.ClassVar = False")),
     ]
 
 

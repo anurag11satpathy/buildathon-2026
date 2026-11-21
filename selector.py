@@ -26,6 +26,14 @@ DATA = Path("/data")
 APP = Path(__file__).resolve().parent
 MAP_PATH = APP / "data" / "map.json.gz"
 IMPORT_MAP_PATH = APP / "data" / "import_funcs.json"  # tools/trace_imports.py
+TEST_IMPORTS_PATH = APP / "data" / "test_imports.json"  # tools/build_test_imports.py
+DIALECT_CHILDREN_PATH = APP / "data" / "dialect_children.json"  # tools/build_dialect_children.py
+DIALECT_PKGS = ("dialects", "parsers", "generators", "typing")
+SHARED_DIALECT_MODULES = {"__init__", "dialect", "base"}
+# base classes every dialect inherits from: an attribute the map has no reader
+# for (read only in lambdas, via strings, or at class creation) -> run all
+BASE_FILES = {"sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/tokens.py",
+              "sqlglot/dialects/dialect.py", "sqlglot/expressions/core.py"}
 MAX_GUARDED_DIALECTS = 3
 SRC = APP / "src"  # pinned sqlglot checkout, downloaded at docker build time
 
@@ -151,6 +159,10 @@ class FileChange:
         return "".join(out)
 
 
+SIGNATURE = chr(10) + "-- " + chr(10)
+DIFF_MARK = chr(10) + "diff --git"
+
+
 def _strip_prefix(p):
     p = p.strip().split("\t")[0]
     if p == "/dev/null":
@@ -159,6 +171,15 @@ def _strip_prefix(p):
 
 
 def parse_patch(text):
+    # `git format-patch` appends a signature line '-- ' then the git version;
+    # it is not part of any hunk (its '-' would read as a removed line)
+    # Only strip when nothing after it could be a hunk line (a removed "- " line
+    # also reads "-- "; a version string like "2.43.0" never starts with " +-").
+    sig = text.rfind(SIGNATURE)
+    if sig != -1:
+        tail = text[sig + len(SIGNATURE):].splitlines()
+        if all(not line or line[0] not in " +-@" for line in tail) and DIFF_MARK not in text[sig:]:
+            text = text[: sig + 1]
     changes, cur, hunk = [], None, None
     for line in text.splitlines():
         if line.startswith("diff --git "):
@@ -254,8 +275,27 @@ CLASS_HOOKS = {"__init_subclass__", "__set_name__", "__class_getitem__"}
 METACLASS_BASES = {"type", "ABCMeta", "EnumMeta", "EnumType"}
 
 
+def ast_equal(a, b):
+    """Same answer as ast.dump(a) == ast.dump(b) (fields only, no line numbers),
+    but stops at the first difference instead of rendering both trees as text."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        return all(ast_equal(getattr(a, f, None), getattr(b, f, None)) for f in a._fields)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(ast_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, (float, complex)):
+        return repr(a) == repr(b)  # dump distinguishes -0.0 from 0.0
+    return a == b
+
+
+def changed_hooks(old, new):
+    return sorted(k for k in old.keys() | new.keys()
+                  if k not in old or k not in new or not ast_equal(old[k], new[k]))
+
+
 def class_creation_hooks(tree):
-    """{qualname: ast.dump} of every function that runs when a class is created:
+    """{qualname: FunctionDef node} of every function that runs when a class is created:
     __init_subclass__/__set_name__/__class_getitem__ anywhere, and every method
     of a metaclass (a class deriving from `type`, directly or through another
     metaclass in this module). Coverage credits these to whichever test first
@@ -287,7 +327,7 @@ def class_creation_hooks(tree):
     for qual, c in classes:
         for f in c.body:
             if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and (c.name in metas or f.name in CLASS_HOOKS):
-                hooks[f"{qual}.{f.name}"] = ast.dump(f)
+                hooks[f"{qual}.{f.name}"] = f
     return hooks
 
 
@@ -345,6 +385,17 @@ class Selector:
             log(f"WARNING: import map unavailable ({e!r}); import-time helper guard disabled")
             self.imp = {"core": {}, "dialects": {}}
         self._core_lines, self._dialect_lines = {}, {}
+        self._base, self._dialect_tests = {}, {}
+        try:  # tools/build_test_imports.py
+            self.test_imports = json.loads(TEST_IMPORTS_PATH.read_text())
+        except (OSError, ValueError) as e:
+            log(f"WARNING: test import graph unavailable ({e!r}); helper edits select own file only")
+            self.test_imports = {}
+        try:
+            self.dialect_children = json.loads(DIALECT_CHILDREN_PATH.read_text())
+        except (OSError, ValueError) as e:
+            log(f"WARNING: dialect children map unavailable ({e!r}); parent edits select own dialect only")
+            self.dialect_children = {}
 
     def core_import_lines(self, rel):
         if rel not in self._core_lines:
@@ -360,9 +411,26 @@ class Selector:
             self._dialect_lines[rel] = d
         return self._dialect_lines[rel]
 
+    def base_file(self, rel):
+        """(text, tree, class-creation hooks, defined functions) of the pinned
+        file, computed once per run: every commit patches the same originals."""
+        if rel not in self._base:
+            text = read_source(rel)
+            if text is None:
+                self._base[rel] = None
+            else:
+                tree = ast.parse(text)
+                self._base[rel] = (text, tree, class_creation_hooks(tree), defined_functions(tree))
+        return self._base[rel]
+
     def dialect_tests(self, name):
         """Tests that use a dialect: anything that ran its dialect/parser/generator/
-        typing module, plus its own test file."""
+        typing module, plus its own test file. Cached: it is the same every commit."""
+        if name not in self._dialect_tests:
+            self._dialect_tests[name] = frozenset(self._dialect_tests_uncached(name))
+        return self._dialect_tests[name]
+
+    def _dialect_tests_uncached(self, name):
         out = set(self.file_tests.get(f"tests/dialects/test_{name}.py", ()))
         for pkg in ("dialects", "parsers", "generators", "typing"):
             info = self.m["files"].get(f"sqlglot/{pkg}/{name}.py")
@@ -394,14 +462,14 @@ class Selector:
         rel = ch.path
         info = self.m["files"][rel]
         funcs = info["funcs"]
-        old_text = read_source(rel)
-        if old_text is None:
+        base = self.base_file(rel)
+        if base is None:
             why.append(f"no source for {rel}")
             return None
+        old_text, old_tree, old_hooks, old_defs = base
         new_text = ch.apply(old_text)
-        # parse each version once; reuse the trees below
+        # the pinned file is parsed once per run (base_file); the patched one here
         try:
-            old_tree = ast.parse(old_text)
             new_tree = ast.parse(new_text)
             compile(new_tree, rel, "exec", dont_inherit=True)  # symtable errors too
         except (SyntaxError, ValueError):
@@ -409,10 +477,9 @@ class Selector:
             return None
 
         # class-creation hooks affect every class they build: run everything
-        old_hooks = class_creation_hooks(old_tree)
         new_hooks = class_creation_hooks(new_tree)
-        if old_hooks != new_hooks:
-            changed = sorted(k for k in old_hooks.keys() | new_hooks.keys() if old_hooks.get(k) != new_hooks.get(k))
+        changed = changed_hooks(old_hooks, new_hooks)
+        if changed:
             why.append(f"class-creation hook changed in {rel}: {changed[:3]}")
             return None
 
@@ -461,7 +528,7 @@ class Selector:
         # an added/removed/renamed function or method changes what the class
         # offers (e.g. a new *_sql override changes generator dispatch), which the
         # neighbouring function's coverage says nothing about: go class-level
-        old_defs, new_defs = defined_functions(old_tree), defined_functions(new_tree)
+        new_defs = defined_functions(new_tree)
         def_names = set()
         if old_defs != new_defs:
             diff = (old_defs - new_defs) + (new_defs - old_defs)
@@ -472,7 +539,7 @@ class Selector:
         if module_lines or def_names:
             tree = old_tree
             sel |= self.set_numbers(info["import"])
-            if not def_names and ast.dump(tree) == ast.dump(new_tree):
+            if not def_names and ast_equal(tree, new_tree):
                 # comments/blank lines only: code is identical, only line numbers
                 # and source text move (source readers are already in `sel`)
                 why.append(f"module-level comment-only in {rel}")
@@ -482,9 +549,13 @@ class Selector:
             if any(t.lstrip().startswith(("import ", "from ")) for t in texts):
                 why.append(f"import change in {rel}")
                 return None
+            edited_targets = set()
             for ln in module_lines:
                 ctx_here = module_level_context(tree, ln)
                 ctx_prev = module_level_context(tree, ln - 1)
+                edited_targets |= ctx_here[1] - set(ctx_here[0])
+                if ln in inserts:
+                    edited_targets |= ctx_prev[1] - set(ctx_prev[0])
                 # a removed line inside an import, or an insert between two lines
                 # of the same (parenthesised) import statement
                 if (ln in removed and ctx_here[2]) or (ln in inserts and ctx_here[2] and ctx_prev[2]):
@@ -500,31 +571,54 @@ class Selector:
                 nxt = min((f for f in funcs if f[0] > ln), key=lambda f: f[0], default=None)
                 if nxt:
                     sel |= self.set_numbers(nxt[3])
+            if rel in BASE_FILES and edited_targets and not any(t in self.m["refs"] for t in edited_targets):
+                why.append(f"base-file attribute with no known readers in {rel}: {sorted(edited_targets)[:4]}")
+                return None
             for n in names:
                 sel |= self.refs(n)
+            # a class-body edit in a dialect module changes that dialect and every
+            # dialect inheriting from it, whether or not the map sees the reader
+            parts = rel.split("/")
+            if len(parts) == 3 and parts[1] in DIALECT_PKGS and parts[2][:-3] not in SHARED_DIALECT_MODULES:
+                fan = [parts[2][:-3]] + self.dialect_children.get(parts[2][:-3], [])
+                for d in fan:
+                    sel |= self.dialect_tests(d)
+                why.append(f"dialect fanout {fan}")
             why.append(f"module-level{sorted(names)[:6]}")
         return sel
 
     def select_test_file(self, ch, why):
         rel = ch.path
-        whole = self.file_tests.get(rel, set())
+        info = self.test_imports.get(rel, {})
+        # a test file can be a library for other test files (test_dialect.py's
+        # Validator is imported and subclassed by 33 dialect test files): a
+        # broad edit to it can break every importer
+        whole = set(self.file_tests.get(rel, set()))
+        for imp in info.get("importers", ()):
+            whole |= self.file_tests.get(imp, set())
+        downstream = f" + {len(info.get('importers', ()))} importing test files" if info else ""
         old_text = read_source(rel)
         if old_text is None or not compiles(ch.apply(old_text), rel):
-            why.append(f"test file {rel}: whole file")
-            return set(whole)
+            why.append(f"test file {rel}: whole file{downstream}")
+            return whole
         removed, inserts, _ = ch.touched()
         lines = removed | inserts | {ln - 1 for ln in inserts}
         spans = self.m["testspans"].get(rel, [])
+        subclassed = set(info.get("subclassed", ()))
         sel = set()
         for ln in lines:
             hit = [s for s in spans if s[0] <= ln <= s[1]]
             if not hit:
-                why.append(f"test file {rel}: module/class level -> whole file")
-                return set(whole)
+                why.append(f"test file {rel}: module/class level -> whole file{downstream}")
+                return whole
             for start, end, qual in hit:
                 if not qual.rsplit("::", 1)[-1].startswith("test"):
-                    why.append(f"test file {rel}: helper {qual} -> whole file")
-                    return set(whole)
+                    why.append(f"test file {rel}: helper {qual} -> whole file{downstream}")
+                    return whole
+                if qual.split("::", 1)[0] in subclassed:
+                    # a test* method of a base class runs again in every subclass
+                    why.append(f"test file {rel}: inherited test {qual} -> whole file{downstream}")
+                    return whole
                 prefix = f"{rel}::{qual}"
                 sel |= {n for tid, n in self._ids_in(rel) if tid == prefix or tid.startswith(prefix + "::")}
         why.append(f"testfile {rel}")
@@ -568,6 +662,9 @@ class Selector:
         changes = parse_patch(text)
         sel, why, any_change = set(), [], False
         self.last_paths = [ch.path for ch in changes if ch.path]
+        if text.strip() and not self.last_paths:
+            why.append("non-empty patch with no recognisable file changes")
+            return None, why
         for ch in changes:
             rel = ch.path
             if rel is None:

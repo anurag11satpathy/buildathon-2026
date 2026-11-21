@@ -1,0 +1,1 @@
+{"hive":["athena","databricks","spark","spark2"],"mysql":["doris","singlestore","starrocks"],"postgres":["materialize","redshift","risingwave"],"presto":["athena","dune","trino"],"spark":["databricks"],"spark2":["databricks","spark"],"trino":["athena","dune"],"tsql":["fabric"]}

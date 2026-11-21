@@ -13,6 +13,8 @@ RUN mkdir -p /app/src \
 
 COPY data/map.json.gz /app/data/map.json.gz
 COPY data/import_funcs.json /app/data/import_funcs.json
+COPY data/test_imports.json /app/data/test_imports.json
+COPY data/dialect_children.json /app/data/dialect_children.json
 COPY selector.py /app/selector.py
 # readable by user nobody at run time
 RUN chmod -R a+rX /app
